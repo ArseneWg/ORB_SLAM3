@@ -185,6 +185,8 @@ public:
     void ChangeDataset();
 
     float GetImageScale();
+    void RunViewerOnCurrentThread();
+    void RequestViewerFinish();
 
 #ifdef REGISTER_TIMES
     void InsertRectTime(double& time);
@@ -193,6 +195,7 @@ public:
 #endif
 
 private:
+    void InitializeViewer();
 
     void SaveAtlas(int type);
     bool LoadAtlas(int type);
@@ -260,6 +263,7 @@ private:
     string mStrSaveAtlasToFile;
 
     string mStrVocabularyFilePath;
+    string mStrSettingsFilePath;
 
     Settings* settings_;
 };

@@ -296,6 +296,8 @@ void Atlas::SetImuInitialized()
 bool Atlas::isImuInitialized()
 {
     unique_lock<mutex> lock(mMutexAtlas);
+    if(!mpCurrentMap)
+        return false;
     return mpCurrentMap->isImuInitialized();
 }
 

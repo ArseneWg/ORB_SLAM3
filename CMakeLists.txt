@@ -1,5 +1,9 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.10)
 project(ORB_SLAM3)
+
+if(APPLE)
+  enable_language(OBJCXX)
+endif()
 
 IF(NOT CMAKE_BUILD_TYPE)
   SET(CMAKE_BUILD_TYPE Release)
@@ -12,11 +16,16 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall   -O3")
 set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -march=native")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
 
-# Check C++11 or C++0x support
+# Check C++14 or fallback support
 include(CheckCXXCompilerFlag)
+CHECK_CXX_COMPILER_FLAG("-std=c++14" COMPILER_SUPPORTS_CXX14)
 CHECK_CXX_COMPILER_FLAG("-std=c++11" COMPILER_SUPPORTS_CXX11)
 CHECK_CXX_COMPILER_FLAG("-std=c++0x" COMPILER_SUPPORTS_CXX0X)
-if(COMPILER_SUPPORTS_CXX11)
+if(COMPILER_SUPPORTS_CXX14)
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
+   add_definitions(-DCOMPILEDWITHC11)
+   message(STATUS "Using flag -std=c++14.")
+elseif(COMPILER_SUPPORTS_CXX11)
    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
    add_definitions(-DCOMPILEDWITHC11)
    message(STATUS "Using flag -std=c++11.")
@@ -30,15 +39,19 @@ endif()
 
 LIST(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake_modules)
 
-find_package(OpenCV 4.4)
-   if(NOT OpenCV_FOUND)
-      message(FATAL_ERROR "OpenCV > 4.4 not found.")
-   endif()
+find_package(OpenCV 4.4 REQUIRED)
 
 MESSAGE("OPENCV VERSION:")
 MESSAGE(${OpenCV_VERSION})
 
-find_package(Eigen3 3.1.0 REQUIRED)
+find_package(Eigen3 REQUIRED NO_MODULE)
+find_path(ORB_SLAM3_EIGEN_INCLUDE_DIR Eigen/Core
+  HINTS ${EIGEN3_INCLUDE_DIR} ${EIGEN3_INCLUDE_DIRS}
+  PATH_SUFFIXES eigen3
+  PATHS /opt/homebrew/include /usr/local/include /usr/include
+)
+find_package(Boost REQUIRED COMPONENTS serialization)
+find_package(OpenSSL REQUIRED)
 find_package(Pangolin REQUIRED)
 find_package(realsense2)
 
@@ -48,6 +61,9 @@ ${PROJECT_SOURCE_DIR}/include
 ${PROJECT_SOURCE_DIR}/include/CameraModels
 ${PROJECT_SOURCE_DIR}/Thirdparty/Sophus
 ${EIGEN3_INCLUDE_DIR}
+${EIGEN3_INCLUDE_DIRS}
+${ORB_SLAM3_EIGEN_INCLUDE_DIR}
+${Boost_INCLUDE_DIRS}
 ${Pangolin_INCLUDE_DIRS}
 )
 
@@ -113,16 +129,18 @@ include/SerializationUtils.h
 include/Config.h
 include/Settings.h)
 
+add_subdirectory(Thirdparty/DBoW2)
 add_subdirectory(Thirdparty/g2o)
 
 target_link_libraries(${PROJECT_NAME}
+DBoW2
+g2o
 ${OpenCV_LIBS}
 ${EIGEN3_LIBS}
+Eigen3::Eigen
 ${Pangolin_LIBRARIES}
-${PROJECT_SOURCE_DIR}/Thirdparty/DBoW2/lib/libDBoW2.so
-${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.so
--lboost_serialization
--lcrypto
+${Boost_LIBRARIES}
+OpenSSL::Crypto
 )
 
 # If RealSense SDK is found the library is added and its examples compiled
@@ -144,6 +162,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/Examples/RGB-D)
 add_executable(rgbd_tum
         Examples/RGB-D/rgbd_tum.cc)
 target_link_libraries(rgbd_tum ${PROJECT_NAME})
+
+add_executable(rgbd_iphone_stream
+        Examples/RGB-D/rgbd_iphone_stream.cc)
+target_link_libraries(rgbd_iphone_stream ${PROJECT_NAME})
 
 if(realsense2_FOUND)
     add_executable(rgbd_realsense_D435i
@@ -192,6 +214,47 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/Examples/Monocular)
 add_executable(mono_tum
         Examples/Monocular/mono_tum.cc)
 target_link_libraries(mono_tum ${PROJECT_NAME})
+
+add_executable(mono_webcam
+        Examples/Monocular/mono_webcam.cc)
+target_link_libraries(mono_webcam ${PROJECT_NAME})
+
+if(APPLE)
+    find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(COREML_FRAMEWORK CoreML REQUIRED)
+    find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
+
+    add_executable(depth_webcam_coreml
+            Examples/Monocular/depth_webcam_coreml.mm)
+    target_link_libraries(depth_webcam_coreml
+            ${OpenCV_LIBS}
+            ${FOUNDATION_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${COREVIDEO_FRAMEWORK})
+    target_compile_options(depth_webcam_coreml PRIVATE -fobjc-arc)
+
+    add_executable(map_webcam_coreml
+            Examples/Monocular/map_webcam_coreml.cc
+            Examples/Monocular/coreml_depth_estimator.mm)
+    target_link_libraries(map_webcam_coreml
+            ${PROJECT_NAME}
+            ${OpenCV_LIBS}
+            ${FOUNDATION_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${COREVIDEO_FRAMEWORK})
+    target_compile_options(map_webcam_coreml PRIVATE -fobjc-arc)
+
+    add_executable(map_iphone_coreml
+            Examples/Monocular/map_iphone_coreml.cc
+            Examples/Monocular/coreml_depth_estimator.mm)
+    target_link_libraries(map_iphone_coreml
+            ${PROJECT_NAME}
+            ${OpenCV_LIBS}
+            ${FOUNDATION_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${COREVIDEO_FRAMEWORK})
+    target_compile_options(map_iphone_coreml PRIVATE -fobjc-arc)
+endif()
 
 add_executable(mono_kitti
         Examples/Monocular/mono_kitti.cc)

@@ -106,6 +106,7 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
     }
 
     mStrVocabularyFilePath = strVocFile;
+    mStrSettingsFilePath = strSettingsFile;
 
     bool loadedAtlas = false;
 
@@ -227,18 +228,38 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
 
     //Initialize the Viewer thread and launch
     if(bUseViewer)
-    //if(false) // TODO
     {
-        mpViewer = new Viewer(this, mpFrameDrawer,mpMapDrawer,mpTracker,strSettingsFile,settings_);
+        InitializeViewer();
         mptViewer = new thread(&Viewer::Run, mpViewer);
-        mpTracker->SetViewer(mpViewer);
-        mpLoopCloser->mpViewer = mpViewer;
-        mpViewer->both = mpFrameDrawer->both;
     }
 
     // Fix verbosity
     Verbose::SetTh(Verbose::VERBOSITY_QUIET);
 
+}
+
+void System::InitializeViewer()
+{
+    if(mpViewer)
+        return;
+
+    mpViewer = new Viewer(this, mpFrameDrawer, mpMapDrawer, mpTracker, mStrSettingsFilePath, settings_);
+    mpTracker->SetViewer(mpViewer);
+    mpLoopCloser->mpViewer = mpViewer;
+    mpAtlas->SetViewer(mpViewer);
+    mpViewer->both = mpFrameDrawer->both;
+}
+
+void System::RunViewerOnCurrentThread()
+{
+    InitializeViewer();
+    mpViewer->Run();
+}
+
+void System::RequestViewerFinish()
+{
+    if(mpViewer)
+        mpViewer->RequestFinish();
 }
 
 Sophus::SE3f System::TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::Point>& vImuMeas, string filename)
@@ -523,12 +544,7 @@ void System::Shutdown()
 
     mpLocalMapper->RequestFinish();
     mpLoopCloser->RequestFinish();
-    /*if(mpViewer)
-    {
-        mpViewer->RequestFinish();
-        while(!mpViewer->isFinished())
-            usleep(5000);
-    }*/
+    RequestViewerFinish();
 
     // Wait until all thread have effectively stopped
     /*while(!mpLocalMapper->isFinished() || !mpLoopCloser->isFinished() || mpLoopCloser->isRunningGBA())
@@ -1546,4 +1562,3 @@ string System::CalculateCheckSum(string filename, int type)
 }
 
 } //namespace ORB_SLAM
-

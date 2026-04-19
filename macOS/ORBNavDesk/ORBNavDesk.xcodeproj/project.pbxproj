@@ -1,0 +1,340 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0E58019908A4E538ECFC2915 /* WorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFF5A6D1A1A8529F9A1453E8 /* WorkspaceView.swift */; };
+		2AB793D0B852EB2B21AB0BC0 /* NavigationMapData.swift in Sources */ = {isa = PBXBuildFile; fileRef = C800884900A24309A923FB89 /* NavigationMapData.swift */; };
+		30D80FA7325C3FE38AD3CCF2 /* InspectorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF70185BE512EC7C23CF6FB8 /* InspectorView.swift */; };
+		496FA9AC4840226B61D41A39 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 047CFDBC0C0209A5C419507D /* AppModel.swift */; };
+		4C8870CCA87E54F03BB7E6E2 /* LiveImageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06E2BA885C9579E32EEE77CC /* LiveImageView.swift */; };
+		6AD77DF40DC6CB1A2509D896 /* SidebarPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6F2F0AE49824609CE4EDCBB /* SidebarPanel.swift */; };
+		8E97A1B62A15D310E30911FA /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F35F034A3E777A36976AAF53 /* ContentView.swift */; };
+		9891F4CBCDF6585AA762A589 /* DashboardComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = D286183967C4E2CAE8687053 /* DashboardComponents.swift */; };
+		9CEBA85AB00243B9C7BCB927 /* ConsolePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12D6B86A35DF4BB46E88CA84 /* ConsolePanel.swift */; };
+		AF6A3C3F1556F5ACD859DF5E /* ORBNavDeskApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E80B05FAF88FEA0C52D7E51 /* ORBNavDeskApp.swift */; };
+		DB68031430E40A4B8305CE0C /* NavigationState.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0FFF663FA839B4FFBCDB6A3 /* NavigationState.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		047CFDBC0C0209A5C419507D /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		06E2BA885C9579E32EEE77CC /* LiveImageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveImageView.swift; sourceTree = "<group>"; };
+		0E80B05FAF88FEA0C52D7E51 /* ORBNavDeskApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ORBNavDeskApp.swift; sourceTree = "<group>"; };
+		12D6B86A35DF4BB46E88CA84 /* ConsolePanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsolePanel.swift; sourceTree = "<group>"; };
+		1E7BD60A0972E60FDF84C2C1 /* ORBNavDesk.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ORBNavDesk.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		BFF5A6D1A1A8529F9A1453E8 /* WorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceView.swift; sourceTree = "<group>"; };
+		C800884900A24309A923FB89 /* NavigationMapData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NavigationMapData.swift; sourceTree = "<group>"; };
+		D0FFF663FA839B4FFBCDB6A3 /* NavigationState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NavigationState.swift; sourceTree = "<group>"; };
+		D286183967C4E2CAE8687053 /* DashboardComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardComponents.swift; sourceTree = "<group>"; };
+		F35F034A3E777A36976AAF53 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		F6F2F0AE49824609CE4EDCBB /* SidebarPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarPanel.swift; sourceTree = "<group>"; };
+		FF70185BE512EC7C23CF6FB8 /* InspectorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InspectorView.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		0CACCC01C719C49D2D5F66A8 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1E7BD60A0972E60FDF84C2C1 /* ORBNavDesk.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		37BE80594F2DC29A38811A63 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		3D043B63B353CB818C8450A1 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				047CFDBC0C0209A5C419507D /* AppModel.swift */,
+				12D6B86A35DF4BB46E88CA84 /* ConsolePanel.swift */,
+				F35F034A3E777A36976AAF53 /* ContentView.swift */,
+				D286183967C4E2CAE8687053 /* DashboardComponents.swift */,
+				FF70185BE512EC7C23CF6FB8 /* InspectorView.swift */,
+				06E2BA885C9579E32EEE77CC /* LiveImageView.swift */,
+				C800884900A24309A923FB89 /* NavigationMapData.swift */,
+				D0FFF663FA839B4FFBCDB6A3 /* NavigationState.swift */,
+				0E80B05FAF88FEA0C52D7E51 /* ORBNavDeskApp.swift */,
+				F6F2F0AE49824609CE4EDCBB /* SidebarPanel.swift */,
+				BFF5A6D1A1A8529F9A1453E8 /* WorkspaceView.swift */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		665730477D3E522698D1B5CB = {
+			isa = PBXGroup;
+			children = (
+				37BE80594F2DC29A38811A63 /* Resources */,
+				3D043B63B353CB818C8450A1 /* Sources */,
+				0CACCC01C719C49D2D5F66A8 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		BCDEB4A014378AEFAAF036C0 /* ORBNavDesk */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 366AE4E68091AC97766EB354 /* Build configuration list for PBXNativeTarget "ORBNavDesk" */;
+			buildPhases = (
+				3911940FADB7A8DFABE68662 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ORBNavDesk;
+			packageProductDependencies = (
+			);
+			productName = ORBNavDesk;
+			productReference = 1E7BD60A0972E60FDF84C2C1 /* ORBNavDesk.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		597D3037541A7E47AC928C65 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					BCDEB4A014378AEFAAF036C0 = {
+						DevelopmentTeam = U69MC68Q72;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = E197889B33F0913F07BB9CBF /* Build configuration list for PBXProject "ORBNavDesk" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 665730477D3E522698D1B5CB;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 0CACCC01C719C49D2D5F66A8 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				BCDEB4A014378AEFAAF036C0 /* ORBNavDesk */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		3911940FADB7A8DFABE68662 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				496FA9AC4840226B61D41A39 /* AppModel.swift in Sources */,
+				9CEBA85AB00243B9C7BCB927 /* ConsolePanel.swift in Sources */,
+				8E97A1B62A15D310E30911FA /* ContentView.swift in Sources */,
+				9891F4CBCDF6585AA762A589 /* DashboardComponents.swift in Sources */,
+				30D80FA7325C3FE38AD3CCF2 /* InspectorView.swift in Sources */,
+				4C8870CCA87E54F03BB7E6E2 /* LiveImageView.swift in Sources */,
+				2AB793D0B852EB2B21AB0BC0 /* NavigationMapData.swift in Sources */,
+				DB68031430E40A4B8305CE0C /* NavigationState.swift in Sources */,
+				AF6A3C3F1556F5ACD859DF5E /* ORBNavDeskApp.swift in Sources */,
+				6AD77DF40DC6CB1A2509D896 /* SidebarPanel.swift in Sources */,
+				0E58019908A4E538ECFC2915 /* WorkspaceView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		0DBA781573F0B402D176D6A9 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = U69MC68Q72;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.xy.ORBNavDesk;
+				PRODUCT_NAME = ORBNavDesk;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		4575DA265261FA90DAC8A114 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Config/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		4D1F8B30962D8CEBCD0897F8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = U69MC68Q72;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.xy.ORBNavDesk;
+				PRODUCT_NAME = ORBNavDesk;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		B3EFA0318FD12D7D8E15D264 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Config/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		366AE4E68091AC97766EB354 /* Build configuration list for PBXNativeTarget "ORBNavDesk" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B3EFA0318FD12D7D8E15D264 /* Debug */,
+				4575DA265261FA90DAC8A114 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		E197889B33F0913F07BB9CBF /* Build configuration list for PBXProject "ORBNavDesk" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4D1F8B30962D8CEBCD0897F8 /* Debug */,
+				0DBA781573F0B402D176D6A9 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 597D3037541A7E47AC928C65 /* Project object */;
+}

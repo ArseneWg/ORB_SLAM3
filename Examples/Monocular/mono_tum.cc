@@ -46,8 +46,16 @@ int main(int argc, char **argv)
 
     int nImages = vstrImageFilenames.size();
 
+    // Pangolin on macOS requires window/event handling on the main thread.
+#ifdef __APPLE__
+    const bool useViewer = false;
+    cout << "macOS detected: running mono_tum without the Pangolin viewer." << endl;
+#else
+    const bool useViewer = true;
+#endif
+
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::MONOCULAR,true);
+    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::MONOCULAR,useViewer);
     float imageScale = SLAM.GetImageScale();
 
     // Vector for tracking time statistics

@@ -1,40 +1,26 @@
-echo "Configuring and building Thirdparty/DBoW2 ..."
+#!/usr/bin/env bash
 
-cd Thirdparty/DBoW2
-mkdir build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j
+set -euo pipefail
 
-cd ../../g2o
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Configuring and building Thirdparty/g2o ..."
-
-mkdir build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j
-
-cd ../../Sophus
-
-echo "Configuring and building Thirdparty/Sophus ..."
-
-mkdir build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j
-
-cd ../../../
+if command -v sysctl >/dev/null 2>&1; then
+  BUILD_JOBS="$(sysctl -n hw.ncpu)"
+elif command -v nproc >/dev/null 2>&1; then
+  BUILD_JOBS="$(nproc)"
+else
+  BUILD_JOBS=4
+fi
 
 echo "Uncompress vocabulary ..."
 
-cd Vocabulary
-tar -xf ORBvoc.txt.tar.gz
-cd ..
+cd "${ROOT_DIR}/Vocabulary"
+if [ ! -f ORBvoc.txt ]; then
+  tar -xf ORBvoc.txt.tar.gz
+fi
+cd "${ROOT_DIR}"
 
 echo "Configuring and building ORB_SLAM3 ..."
 
-mkdir build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j4
+cmake -S "${ROOT_DIR}" -B "${ROOT_DIR}/build" -DCMAKE_BUILD_TYPE=Release
+cmake --build "${ROOT_DIR}/build" -j"${BUILD_JOBS}"

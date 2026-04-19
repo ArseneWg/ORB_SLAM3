@@ -338,6 +338,12 @@ void Viewer::Run()
         cv::imshow("ORB-SLAM3: Current Frame",toShow);
         cv::waitKey(mT);
 
+        if(pangolin::ShouldQuit())
+        {
+            mpSystem->Shutdown();
+            RequestFinish();
+        }
+
         if(menuReset)
         {
             menuShowGraph = true;

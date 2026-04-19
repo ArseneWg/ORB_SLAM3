@@ -1,0 +1,32 @@
+name: ORBNavDesk
+options:
+  minimumXcodeGenVersion: 2.45.0
+  defaultConfig: Debug
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: com.xy.ORBNavDesk
+    PRODUCT_NAME: ORBNavDesk
+    SWIFT_VERSION: 6.0
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 1.0
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: U69MC68Q72
+targets:
+  ORBNavDesk:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Sources
+      - path: Resources
+        buildPhase: resources
+    settings:
+      base:
+        INFOPLIST_FILE: Config/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MACOSX_DEPLOYMENT_TARGET: 15.0
+    info:
+      path: Config/Info.plist
+      properties:
+        CFBundleDisplayName: ORB Nav Desk
+        LSApplicationCategoryType: public.app-category.developer-tools

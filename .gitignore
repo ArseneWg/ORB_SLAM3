@@ -87,6 +87,12 @@ Table_TUMVI_rooms/
 *.osa
 .idea/
 my_settings.txt
+__pycache__/
+xcuserdata/
+*.xcuserstate
+iphone_rgbd_nav_latest*.png
+iphone_rgbd_nav_map.json
+iphone_*Trajectory.txt
 
 borrar/*
 

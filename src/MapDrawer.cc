@@ -180,24 +180,33 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
     const float &w = mKeyFrameSize;
     const float h = w*0.75;
     const float z = w*0.6;
+    const size_t frameColorCount = sizeof(mfFrameColors) / sizeof(mfFrameColors[0]);
 
     Map* pActiveMap = mpAtlas->GetCurrentMap();
-    // DEBUG LBA
-    std::set<long unsigned int> sOptKFs = pActiveMap->msOptKFs;
-    std::set<long unsigned int> sFixedKFs = pActiveMap->msFixedKFs;
-
     if(!pActiveMap)
         return;
 
-    const vector<KeyFrame*> vpKFs = pActiveMap->GetAllKeyFrames();
+    vector<KeyFrame*> vpKFs;
+    std::set<long unsigned int> sOptKFs;
+    std::set<long unsigned int> sFixedKFs;
 
+    {
+        unique_lock<mutex> lock(pActiveMap->mMutexMapUpdate);
+        sOptKFs = pActiveMap->msOptKFs;
+        sFixedKFs = pActiveMap->msFixedKFs;
+        vpKFs = pActiveMap->GetAllKeyFrames();
+    }
+
+    // DEBUG LBA
     if(bDrawKF)
     {
         for(size_t i=0; i<vpKFs.size(); i++)
         {
             KeyFrame* pKF = vpKFs[i];
+            if(!pKF || pKF->isBad() || pKF->GetMap() != pActiveMap)
+                continue;
+
             Eigen::Matrix4f Twc = pKF->GetPoseInverse().matrix();
-            unsigned int index_color = pKF->mnOriginMapId;
 
             glPushMatrix();
 
@@ -271,6 +280,9 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
         // cout << "-----------------Draw graph-----------------" << endl;
         for(size_t i=0; i<vpKFs.size(); i++)
         {
+            if(!vpKFs[i] || vpKFs[i]->isBad() || vpKFs[i]->GetMap() != pActiveMap)
+                continue;
+
             // Covisibility Graph
             const vector<KeyFrame*> vCovKFs = vpKFs[i]->GetCovisiblesByWeight(100);
             Eigen::Vector3f Ow = vpKFs[i]->GetCameraCenter();
@@ -339,16 +351,23 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
     {
         for(Map* pMap : vpMaps)
         {
-            if(pMap == pActiveMap)
+            if(!pMap || pMap == pActiveMap || pMap->IsBad())
                 continue;
 
-            vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
+            vector<KeyFrame*> vpKFs;
+            {
+                unique_lock<mutex> lock(pMap->mMutexMapUpdate);
+                vpKFs = pMap->GetAllKeyFrames();
+            }
 
             for(size_t i=0; i<vpKFs.size(); i++)
             {
                 KeyFrame* pKF = vpKFs[i];
+                if(!pKF || pKF->isBad() || pKF->GetMap() != pMap)
+                    continue;
+
                 Eigen::Matrix4f Twc = pKF->GetPoseInverse().matrix();
-                unsigned int index_color = pKF->mnOriginMapId;
+                const size_t index_color = pKF->mnOriginMapId % frameColorCount;
 
                 glPushMatrix();
 
