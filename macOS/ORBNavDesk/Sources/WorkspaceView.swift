@@ -48,6 +48,16 @@ struct WorkspaceView: View {
                         placeholderDescription: "深度图会随 iPhone RGB-D 数据自动刷新。"
                     )
                     .frame(minWidth: 340, idealWidth: 340, maxWidth: 340, minHeight: 300, maxHeight: .infinity)
+
+                    ImageCanvasView(
+                        title: "Small V2 误差",
+                        subtitle: "将模型深度按传感器尺度对齐后，与 iPhone 深度做逐像素绝对误差热图。",
+                        image: model.latestDepthDiffImage,
+                        accent: .pink,
+                        placeholderTitle: "等待深度对比",
+                        placeholderDescription: "Small V2 推理与误差热图会在这里更新。"
+                    )
+                    .frame(minWidth: 340, idealWidth: 340, maxWidth: 340, minHeight: 220, maxHeight: .infinity)
                 }
             }
 

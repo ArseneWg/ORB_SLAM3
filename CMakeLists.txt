@@ -224,6 +224,15 @@ if(APPLE)
     find_library(COREML_FRAMEWORK CoreML REQUIRED)
     find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
 
+    target_sources(rgbd_iphone_stream PRIVATE
+            Examples/Monocular/coreml_depth_estimator.mm)
+    target_link_libraries(rgbd_iphone_stream
+            ${OpenCV_LIBS}
+            ${FOUNDATION_FRAMEWORK}
+            ${COREML_FRAMEWORK}
+            ${COREVIDEO_FRAMEWORK})
+    target_compile_options(rgbd_iphone_stream PRIVATE -fobjc-arc)
+
     add_executable(depth_webcam_coreml
             Examples/Monocular/depth_webcam_coreml.mm)
     target_link_libraries(depth_webcam_coreml

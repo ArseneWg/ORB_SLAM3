@@ -7,6 +7,7 @@ struct InspectorView: View {
     @SceneStorage("orbnavdesk.inspector.hoverExpanded") private var hoverExpanded = false
     @SceneStorage("orbnavdesk.inspector.mapDisplayExpanded") private var mapDisplayExpanded = false
     @SceneStorage("orbnavdesk.inspector.scaleExpanded") private var scaleExpanded = false
+    @SceneStorage("orbnavdesk.inspector.depthComparisonExpanded") private var depthComparisonExpanded = true
     @SceneStorage("orbnavdesk.inspector.legendExpanded") private var legendExpanded = false
     @SceneStorage("orbnavdesk.inspector.filesExpanded") private var filesExpanded = false
 
@@ -87,6 +88,28 @@ struct InspectorView: View {
                 }
 
                 CollapsiblePanelCard(
+                    title: "深度对比",
+                    subtitle: "比较 iPhone 传感器深度与 Small V2 预测深度的对齐误差",
+                    isExpanded: $depthComparisonExpanded
+                ) {
+                    DetailRow(label: "模型状态", value: depthStatusText)
+                    DetailRow(label: "重叠像素", value: overlapSummary)
+                    DetailRow(label: "对齐斜率", value: depthScaleSummary)
+                    DetailRow(label: "对齐偏移", value: depthOffsetSummary)
+                    DetailRow(label: "推理耗时", value: inferenceSummary)
+                    DetailRow(label: "MAE", value: depthMetric(model.runtimeState?.depthComparisonMaeMeters))
+                    DetailRow(label: "RMSE", value: depthMetric(model.runtimeState?.depthComparisonRmseMeters))
+                    DetailRow(label: "Abs Rel", value: depthRatio(model.runtimeState?.depthComparisonAbsRel))
+                    DetailRow(label: "Bias", value: depthMetric(model.runtimeState?.depthComparisonBiasMeters))
+
+                    HStack(spacing: 10) {
+                        Button("打开模型深度") { model.openDepthComparisonArtifact(.modelDepth) }
+                        Button("打开误差热图") { model.openDepthComparisonArtifact(.depthDiff) }
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                CollapsiblePanelCard(
                     title: "地图图例",
                     subtitle: "图例从主地图挪到了这里，避免遮挡可视区域",
                     isExpanded: $legendExpanded
@@ -116,6 +139,8 @@ struct InspectorView: View {
                     DetailRow(label: "latest 图", value: model.latestSnapshotURL?.path ?? "--")
                     DetailRow(label: "guidance", value: model.guidanceURL?.path ?? "--")
                     DetailRow(label: "地图数据", value: model.mapDataURL?.path ?? "--")
+                    DetailRow(label: "模型深度", value: model.latestModelDepthURL?.path ?? "--")
+                    DetailRow(label: "误差热图", value: model.latestDepthDiffURL?.path ?? "--")
 
                     HStack(spacing: 10) {
                         Button("打开 latest") { model.openLatestSnapshot() }
@@ -170,5 +195,66 @@ struct InspectorView: View {
     private func scaleRatio(_ value: Double?) -> String {
         guard let value, value > 0 else { return "--" }
         return String(format: "%.3fx", value)
+    }
+
+    private func ratio(_ value: Double?) -> String {
+        guard let value, value > 0 else { return "--" }
+        return String(format: "%.3f", value)
+    }
+
+    private var overlapSummary: String {
+        guard let state = model.runtimeState,
+              state.depthComparisonReady,
+              state.depthComparisonValidSensorPixels > 0 else { return "--" }
+        return "\(state.depthComparisonValidOverlapPixels) / \(state.depthComparisonValidSensorPixels) (\(String(format: "%.1f%%", state.depthComparisonOverlapRatio * 100.0)))"
+    }
+
+    private var depthScaleSummary: String {
+        guard model.runtimeState?.depthComparisonReady == true,
+              let scale = model.runtimeState?.depthComparisonAlignmentScale,
+              scale > 0 else { return "--" }
+        return String(format: "%.3f", scale)
+    }
+
+    private var depthOffsetSummary: String {
+        guard model.runtimeState?.depthComparisonReady == true,
+              let offset = model.runtimeState?.depthComparisonAlignmentOffset,
+              offset.isFinite else { return "--" }
+        return String(format: "%.3f", offset)
+    }
+
+    private var inferenceSummary: String {
+        guard let ms = model.runtimeState?.depthComparisonInferenceMs, ms > 0 else { return "--" }
+        return String(format: "%.1f ms", ms)
+    }
+
+    private var depthStatusText: String {
+        guard let state = model.runtimeState else { return "--" }
+        if !state.depthModelEnabled { return "未启用" }
+        if state.depthComparisonReady { return "已完成对比" }
+        switch state.depthComparisonStatus {
+        case "READY":
+            return "模型已就绪"
+        case "INSUFFICIENT_OVERLAP":
+            return "有效重叠不足"
+        case "INFERENCE_FAILED":
+            return "推理失败"
+        case "MODEL_UNAVAILABLE":
+            return "模型不可用"
+        default:
+            return state.depthComparisonStatus
+        }
+    }
+
+    private func depthMetric(_ value: Double?) -> String {
+        guard model.runtimeState?.depthComparisonReady == true,
+              let value else { return "--" }
+        return String(format: "%.2f m", value)
+    }
+
+    private func depthRatio(_ value: Double?) -> String {
+        guard model.runtimeState?.depthComparisonReady == true,
+              let value, value > 0 else { return "--" }
+        return String(format: "%.3f", value)
     }
 }

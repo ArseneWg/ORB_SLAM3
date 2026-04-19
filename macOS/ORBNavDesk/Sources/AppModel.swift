@@ -1,12 +1,18 @@
 import AppKit
 import Foundation
 
+enum DepthComparisonArtifact {
+    case modelDepth
+    case depthDiff
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var runtimeState: NavigationRuntimeState?
     @Published var latestImage: NSImage?
     @Published var latestRgbImage: NSImage?
     @Published var latestDepthImage: NSImage?
+    @Published var latestDepthDiffImage: NSImage?
     @Published var mapData: NavigationMapData?
     @Published var logs: String = ""
     @Published var backendRunning = false
@@ -43,6 +49,7 @@ final class AppModel: ObservableObject {
     private var lastImageMTime: Date?
     private var lastRgbImageMTime: Date?
     private var lastDepthImageMTime: Date?
+    private var lastDepthDiffImageMTime: Date?
     private var lastMapDataMTime: Date?
     private var lastStateMTime: Date?
 
@@ -63,6 +70,16 @@ final class AppModel: ObservableObject {
 
     var latestDepthURL: URL? {
         guard let path = runtimeState?.latestDepthPath, !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    var latestModelDepthURL: URL? {
+        guard let path = runtimeState?.latestModelDepthPath, !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    var latestDepthDiffURL: URL? {
+        guard let path = runtimeState?.latestDepthDiffPath, !path.isEmpty else { return nil }
         return URL(fileURLWithPath: path)
     }
 
@@ -206,6 +223,30 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    func openDepthComparisonArtifact(_ kind: DepthComparisonArtifact) {
+        let url: URL?
+        switch kind {
+        case .modelDepth:
+            url = latestModelDepthURL
+        case .depthDiff:
+            url = latestDepthDiffURL
+        }
+        guard let url else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func revealDepthComparisonArtifact(_ kind: DepthComparisonArtifact) {
+        let url: URL?
+        switch kind {
+        case .modelDepth:
+            url = latestModelDepthURL
+        case .depthDiff:
+            url = latestDepthDiffURL
+        }
+        guard let url else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
     func openWorkspaceRootInFinder() {
         NSWorkspace.shared.open(workspaceRoot)
     }
@@ -337,6 +378,7 @@ final class AppModel: ObservableObject {
     private func loadPanelImagesIfNeeded() {
         loadImage(at: latestRgbURL, lastModified: &lastRgbImageMTime, assign: { latestRgbImage = $0 })
         loadImage(at: latestDepthURL, lastModified: &lastDepthImageMTime, assign: { latestDepthImage = $0 })
+        loadImage(at: latestDepthDiffURL, lastModified: &lastDepthDiffImageMTime, assign: { latestDepthDiffImage = $0 })
     }
 
     private func loadMapDataIfNeeded() {

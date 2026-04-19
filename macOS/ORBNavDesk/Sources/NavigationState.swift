@@ -16,6 +16,19 @@ struct NavigationRuntimeState: Codable {
     let orbDistanceMeters: Double
     let phoneDistanceMeters: Double
     let scaleRatio: Double
+    let depthModelEnabled: Bool
+    let depthComparisonReady: Bool
+    let depthComparisonStatus: String
+    let depthComparisonValidSensorPixels: Int
+    let depthComparisonValidOverlapPixels: Int
+    let depthComparisonOverlapRatio: Double
+    let depthComparisonAlignmentScale: Double
+    let depthComparisonAlignmentOffset: Double
+    let depthComparisonInferenceMs: Double
+    let depthComparisonMaeMeters: Double
+    let depthComparisonRmseMeters: Double
+    let depthComparisonAbsRel: Double
+    let depthComparisonBiasMeters: Double
     let hasGoal: Bool
     let pathValid: Bool
     let hasWaypoint: Bool
@@ -35,6 +48,8 @@ struct NavigationRuntimeState: Codable {
     let latestImagePath: String
     let latestRgbPath: String
     let latestDepthPath: String
+    let latestModelDepthPath: String
+    let latestDepthDiffPath: String
     let latestMapPath: String
     let mapDataPath: String
     let guidancePath: String

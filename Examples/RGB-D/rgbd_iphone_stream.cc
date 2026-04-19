@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -43,6 +44,10 @@
 
 #include <System.h>
 
+#ifdef __APPLE__
+#include "../Monocular/coreml_depth_estimator.h"
+#endif
+
 using namespace std;
 using boost::property_tree::ptree;
 
@@ -55,6 +60,7 @@ constexpr float kGridResolutionMeters = 0.05f;
 constexpr float kMinDepthMeters = 0.15f;
 constexpr float kMaxDepthMeters = 4.5f;
 constexpr int kDepthStride = 6;
+constexpr float kDepthDiffVisualMaxMeters = 1.00f;
 constexpr float kFloorClearanceMeters = 0.05f;
 constexpr float kObstacleHeightMeters = 1.10f;
 constexpr float kAssumedCameraHeightMeters = 0.30f;
@@ -190,6 +196,23 @@ struct GuidanceState {
     float targetYawDegrees = 0.0f;
 };
 
+struct DepthComparisonDiagnostics {
+    bool modelEnabled = false;
+    bool modelReady = false;
+    bool hasComparison = false;
+    string status = "DISABLED";
+    int validSensorPixels = 0;
+    int validOverlapPixels = 0;
+    float overlapRatio = 0.0f;
+    float alignmentScale = 0.0f;
+    float alignmentOffset = 0.0f;
+    float inferenceMs = 0.0f;
+    float maeMeters = 0.0f;
+    float rmseMeters = 0.0f;
+    float absRel = 0.0f;
+    float biasMeters = 0.0f;
+};
+
 struct BackendControl {
     int revision = -1;
     string viewMode;
@@ -222,6 +245,8 @@ string CurrentTimeString();
 string BuildLatestSnapshotPath();
 string BuildLatestRgbPath();
 string BuildLatestDepthPath();
+string BuildLatestModelDepthPath();
+string BuildLatestDepthDiffPath();
 string BuildLatestMapPath();
 string BuildLatestMapDataPath();
 void WriteMapRenderData(const string& path,
@@ -749,6 +774,7 @@ void WriteBackendState(const string& path,
                        const GuidanceState& guidance,
                        const NavigationSettings& navigationSettings,
                        const ScaleDiagnostics& diagnostics,
+                       const DepthComparisonDiagnostics& depthComparison,
                        const OccupancyViewState& viewState,
                        const cv::Rect& mapRect,
                        const cv::Size& compositeSize,
@@ -773,6 +799,19 @@ void WriteBackendState(const string& path,
     out << "  \"phoneDistanceMeters\": " << fixed << setprecision(3) << diagnostics.phoneDistanceMeters << ",\n";
     out << "  \"scaleRatio\": " << fixed << setprecision(4)
         << ((diagnostics.phoneDistanceMeters > 1e-4f) ? (diagnostics.orbDistanceMeters / diagnostics.phoneDistanceMeters) : 0.0f) << ",\n";
+    out << "  \"depthModelEnabled\": " << (depthComparison.modelEnabled ? "true" : "false") << ",\n";
+    out << "  \"depthComparisonReady\": " << (depthComparison.hasComparison ? "true" : "false") << ",\n";
+    out << "  \"depthComparisonStatus\": \"" << depthComparison.status << "\",\n";
+    out << "  \"depthComparisonValidSensorPixels\": " << depthComparison.validSensorPixels << ",\n";
+    out << "  \"depthComparisonValidOverlapPixels\": " << depthComparison.validOverlapPixels << ",\n";
+    out << "  \"depthComparisonOverlapRatio\": " << fixed << setprecision(4) << depthComparison.overlapRatio << ",\n";
+    out << "  \"depthComparisonAlignmentScale\": " << fixed << setprecision(4) << depthComparison.alignmentScale << ",\n";
+    out << "  \"depthComparisonAlignmentOffset\": " << fixed << setprecision(4) << depthComparison.alignmentOffset << ",\n";
+    out << "  \"depthComparisonInferenceMs\": " << fixed << setprecision(3) << depthComparison.inferenceMs << ",\n";
+    out << "  \"depthComparisonMaeMeters\": " << fixed << setprecision(4) << depthComparison.maeMeters << ",\n";
+    out << "  \"depthComparisonRmseMeters\": " << fixed << setprecision(4) << depthComparison.rmseMeters << ",\n";
+    out << "  \"depthComparisonAbsRel\": " << fixed << setprecision(4) << depthComparison.absRel << ",\n";
+    out << "  \"depthComparisonBiasMeters\": " << fixed << setprecision(4) << depthComparison.biasMeters << ",\n";
     out << "  \"hasGoal\": " << (planner.hasGoal ? "true" : "false") << ",\n";
     out << "  \"pathValid\": " << (planner.pathValid ? "true" : "false") << ",\n";
     out << "  \"hasWaypoint\": " << (guidance.hasWaypoint ? "true" : "false") << ",\n";
@@ -792,6 +831,8 @@ void WriteBackendState(const string& path,
     out << "  \"latestImagePath\": \"" << BuildLatestSnapshotPath() << "\",\n";
     out << "  \"latestRgbPath\": \"" << BuildLatestRgbPath() << "\",\n";
     out << "  \"latestDepthPath\": \"" << BuildLatestDepthPath() << "\",\n";
+    out << "  \"latestModelDepthPath\": \"" << BuildLatestModelDepthPath() << "\",\n";
+    out << "  \"latestDepthDiffPath\": \"" << BuildLatestDepthDiffPath() << "\",\n";
     out << "  \"latestMapPath\": \"" << BuildLatestMapPath() << "\",\n";
     out << "  \"mapDataPath\": \"" << BuildLatestMapDataPath() << "\",\n";
     out << "  \"guidancePath\": \"/tmp/iphone_rgbd_nav_guidance.json\"\n";
@@ -1025,6 +1066,235 @@ cv::Mat ColorizeDepthMm(const cv::Mat& depthMm) {
     cv::applyColorMap(normalized8u, colored, cv::COLORMAP_TURBO);
     colored.setTo(cv::Scalar(0, 0, 0), ~validMask);
     return colored;
+}
+
+cv::Mat ColorizeDepthFloat(const cv::Mat& depth32f, const cv::Mat& validMask = cv::Mat()) {
+    cv::Mat sanitized = depth32f.clone();
+    cv::patchNaNs(sanitized, 0.0f);
+
+    cv::Mat effectiveMask;
+    if(validMask.empty())
+        effectiveMask = sanitized > 0.0f;
+    else
+        cv::bitwise_and(validMask, sanitized > 0.0f, effectiveMask);
+
+    double minDepth = 0.0;
+    double maxDepth = 0.0;
+    cv::minMaxLoc(sanitized, &minDepth, &maxDepth, nullptr, nullptr, effectiveMask);
+    if(maxDepth <= minDepth + numeric_limits<double>::epsilon())
+        return cv::Mat(depth32f.size(), CV_8UC3, cv::Scalar(20, 20, 20));
+
+    cv::Mat normalized;
+    sanitized.convertTo(normalized, CV_32F, 255.0 / (maxDepth - minDepth), -minDepth * 255.0 / (maxDepth - minDepth));
+    normalized.setTo(0.0f, ~effectiveMask);
+
+    cv::Mat normalized8u;
+    normalized.convertTo(normalized8u, CV_8U);
+    normalized8u = 255 - normalized8u;
+
+    cv::Mat colored;
+    cv::applyColorMap(normalized8u, colored, cv::COLORMAP_TURBO);
+    colored.setTo(cv::Scalar(0, 0, 0), ~effectiveMask);
+    return colored;
+}
+
+cv::Mat ColorizeDepthError(const cv::Mat& absErrorMeters, const cv::Mat& validMask) {
+    cv::Mat sanitized = absErrorMeters.clone();
+    cv::patchNaNs(sanitized, 0.0f);
+    cv::threshold(sanitized, sanitized, kDepthDiffVisualMaxMeters, kDepthDiffVisualMaxMeters, cv::THRESH_TRUNC);
+
+    cv::Mat normalized;
+    sanitized.convertTo(normalized, CV_32F, 255.0 / kDepthDiffVisualMaxMeters);
+    normalized.setTo(0.0f, ~validMask);
+
+    cv::Mat normalized8u;
+    normalized.convertTo(normalized8u, CV_8U);
+
+    cv::Mat colored;
+    cv::applyColorMap(normalized8u, colored, cv::COLORMAP_TURBO);
+    colored.setTo(cv::Scalar(0, 0, 0), ~validMask);
+    return colored;
+}
+
+float MedianInPlace(vector<float>& values) {
+    if(values.empty())
+        return 0.0f;
+
+    const size_t middle = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + middle, values.end());
+    float median = values[middle];
+    if(values.size() % 2 == 0) {
+        std::nth_element(values.begin(), values.begin() + middle - 1, values.end());
+        median = 0.5f * (median + values[middle - 1]);
+    }
+    return median;
+}
+
+bool SolveAffineLeastSquares(const vector<float>& x,
+                             const vector<float>& y,
+                             const vector<uint8_t>* inlierMask,
+                             double& scale,
+                             double& offset) {
+    double sumX = 0.0;
+    double sumY = 0.0;
+    double sumXX = 0.0;
+    double sumXY = 0.0;
+    size_t count = 0;
+    for(size_t index = 0; index < x.size(); ++index) {
+        if(inlierMask && (*inlierMask)[index] == 0)
+            continue;
+        const double xv = static_cast<double>(x[index]);
+        const double yv = static_cast<double>(y[index]);
+        sumX += xv;
+        sumY += yv;
+        sumXX += xv * xv;
+        sumXY += xv * yv;
+        ++count;
+    }
+
+    if(count < 64)
+        return false;
+
+    const double denom = static_cast<double>(count) * sumXX - sumX * sumX;
+    if(std::abs(denom) < 1e-9)
+        return false;
+
+    scale = (static_cast<double>(count) * sumXY - sumX * sumY) / denom;
+    offset = (sumY - scale * sumX) / static_cast<double>(count);
+    return std::isfinite(scale) && std::isfinite(offset);
+}
+
+DepthComparisonDiagnostics CompareDepthMaps(const cv::Mat& sensorDepthMm,
+                                           const cv::Mat& modelDepth32f,
+                                           cv::Mat& alignedModelDepthMeters,
+                                           cv::Mat& absErrorMeters,
+                                           cv::Mat& validMask) {
+    DepthComparisonDiagnostics diagnostics;
+    if(sensorDepthMm.empty() || modelDepth32f.empty())
+        return diagnostics;
+
+    cv::Mat sensorDepthMeters;
+    sensorDepthMm.convertTo(sensorDepthMeters, CV_32F, 0.001);
+
+    cv::Mat modelDepth = modelDepth32f.clone();
+    cv::patchNaNs(modelDepth, 0.0f);
+
+    cv::Mat sensorValidMask = (sensorDepthMm > 0);
+    cv::bitwise_and(sensorValidMask, sensorDepthMeters >= kMinDepthMeters, sensorValidMask);
+    cv::bitwise_and(sensorValidMask, sensorDepthMeters <= kMaxDepthMeters, sensorValidMask);
+    diagnostics.validSensorPixels = cv::countNonZero(sensorValidMask);
+
+    cv::Mat modelValidMask = modelDepth > 1e-5f;
+    cv::bitwise_and(sensorValidMask, modelValidMask, validMask);
+    diagnostics.validOverlapPixels = cv::countNonZero(validMask);
+    if(diagnostics.validSensorPixels > 0)
+        diagnostics.overlapRatio = static_cast<float>(diagnostics.validOverlapPixels) /
+                                   static_cast<float>(diagnostics.validSensorPixels);
+
+    if(diagnostics.validOverlapPixels < 64)
+        return diagnostics;
+
+    vector<float> modelSamples;
+    vector<float> inverseDepthTargets;
+    modelSamples.reserve(static_cast<size_t>(diagnostics.validOverlapPixels));
+    inverseDepthTargets.reserve(static_cast<size_t>(diagnostics.validOverlapPixels));
+    for(int y = 0; y < sensorDepthMeters.rows; ++y) {
+        const float* sensorPtr = sensorDepthMeters.ptr<float>(y);
+        const float* modelPtr = modelDepth.ptr<float>(y);
+        const uchar* maskPtr = validMask.ptr<uchar>(y);
+        for(int x = 0; x < sensorDepthMeters.cols; ++x) {
+            if(maskPtr[x] == 0)
+                continue;
+            modelSamples.push_back(modelPtr[x]);
+            inverseDepthTargets.push_back(1.0f / std::max(sensorPtr[x], 1e-6f));
+        }
+    }
+
+    double scale = 0.0;
+    double offset = 0.0;
+    if(!SolveAffineLeastSquares(modelSamples, inverseDepthTargets, nullptr, scale, offset))
+        return diagnostics;
+
+    vector<float> residuals;
+    residuals.reserve(modelSamples.size());
+    for(size_t index = 0; index < modelSamples.size(); ++index) {
+        const double predictedInverseDepth = scale * static_cast<double>(modelSamples[index]) + offset;
+        residuals.push_back(static_cast<float>(predictedInverseDepth - static_cast<double>(inverseDepthTargets[index])));
+    }
+
+    vector<float> residualCopy = residuals;
+    const float residualMedian = MedianInPlace(residualCopy);
+    for(float& residual : residuals)
+        residual = std::fabs(residual - residualMedian);
+
+    const float residualMad = MedianInPlace(residuals);
+    if(std::isfinite(residualMad) && residualMad > 1e-6f) {
+        const float threshold = std::max(3.0f * residualMad, 0.02f);
+        vector<uint8_t> inlierMask(modelSamples.size(), 0);
+        size_t inlierCount = 0;
+        for(size_t index = 0; index < modelSamples.size(); ++index) {
+            const double predictedInverseDepth = scale * static_cast<double>(modelSamples[index]) + offset;
+            const double centeredResidual = std::fabs(predictedInverseDepth -
+                                                      static_cast<double>(inverseDepthTargets[index]) -
+                                                      static_cast<double>(residualMedian));
+            if(centeredResidual <= static_cast<double>(threshold)) {
+                inlierMask[index] = 1;
+                ++inlierCount;
+            }
+        }
+
+        double refinedScale = 0.0;
+        double refinedOffset = 0.0;
+        if(inlierCount >= 64 && SolveAffineLeastSquares(modelSamples, inverseDepthTargets, &inlierMask, refinedScale, refinedOffset)) {
+            scale = refinedScale;
+            offset = refinedOffset;
+        }
+    }
+
+    diagnostics.alignmentScale = static_cast<float>(scale);
+    diagnostics.alignmentOffset = static_cast<float>(offset);
+    if(!std::isfinite(diagnostics.alignmentScale) || !std::isfinite(diagnostics.alignmentOffset))
+        return diagnostics;
+
+    alignedModelDepthMeters = cv::Mat(modelDepth.size(), CV_32F, cv::Scalar(0.0f));
+    absErrorMeters = cv::Mat(sensorDepthMeters.size(), CV_32F, cv::Scalar(0.0f));
+
+    double absErrorSum = 0.0;
+    double squaredErrorSum = 0.0;
+    double absRelSum = 0.0;
+    double biasSum = 0.0;
+
+    for(int y = 0; y < sensorDepthMeters.rows; ++y) {
+        const float* sensorPtr = sensorDepthMeters.ptr<float>(y);
+        const float* modelPtr = modelDepth.ptr<float>(y);
+        float* alignedPtr = alignedModelDepthMeters.ptr<float>(y);
+        float* errorPtr = absErrorMeters.ptr<float>(y);
+        const uchar* maskPtr = validMask.ptr<uchar>(y);
+        for(int x = 0; x < sensorDepthMeters.cols; ++x) {
+            if(maskPtr[x] == 0)
+                continue;
+
+            const double predictedInverseDepth = static_cast<double>(diagnostics.alignmentScale) * static_cast<double>(modelPtr[x]) +
+                                                 static_cast<double>(diagnostics.alignmentOffset);
+            const double predictedDepth = 1.0 / std::max(1e-6, predictedInverseDepth);
+            alignedPtr[x] = static_cast<float>(predictedDepth);
+            const double signedError = static_cast<double>(alignedPtr[x]) - static_cast<double>(sensorPtr[x]);
+            const double absoluteError = std::fabs(signedError);
+            errorPtr[x] = static_cast<float>(absoluteError);
+            absErrorSum += absoluteError;
+            squaredErrorSum += signedError * signedError;
+            absRelSum += absoluteError / std::max(1e-6, static_cast<double>(sensorPtr[x]));
+            biasSum += signedError;
+        }
+    }
+
+    const double validCount = static_cast<double>(diagnostics.validOverlapPixels);
+    diagnostics.maeMeters = static_cast<float>(absErrorSum / validCount);
+    diagnostics.rmseMeters = static_cast<float>(std::sqrt(squaredErrorSum / validCount));
+    diagnostics.absRel = static_cast<float>(absRelSum / validCount);
+    diagnostics.biasMeters = static_cast<float>(biasSum / validCount);
+    diagnostics.hasComparison = true;
+    return diagnostics;
 }
 
 cv::Size MeasureOverlayText(const string& text, int fontHeight, int thickness, int* baseline = nullptr) {
@@ -2016,6 +2286,14 @@ string BuildLatestDepthPath() {
     return CurrentWorkingDirectory() + "/iphone_rgbd_nav_latest_depth.png";
 }
 
+string BuildLatestModelDepthPath() {
+    return CurrentWorkingDirectory() + "/iphone_rgbd_nav_latest_model_depth.png";
+}
+
+string BuildLatestDepthDiffPath() {
+    return CurrentWorkingDirectory() + "/iphone_rgbd_nav_latest_depth_diff.png";
+}
+
 string BuildLatestMapPath() {
     return CurrentWorkingDirectory() + "/iphone_rgbd_nav_latest_map.png";
 }
@@ -2190,7 +2468,9 @@ void SaveSnapshot(const cv::Mat& image) {
 void UpdateLatestArtifacts(const cv::Mat& image,
                           const cv::Mat& rgbPanel,
                           const cv::Mat& depthPanel,
-                          const cv::Mat& mapPanel) {
+                          const cv::Mat& mapPanel,
+                          const cv::Mat& modelDepthPanel,
+                          const cv::Mat& depthDiffPanel) {
     static auto lastWriteTime = chrono::steady_clock::now() - chrono::seconds(10);
     const auto now = chrono::steady_clock::now();
     if(now - lastWriteTime < chrono::seconds(2))
@@ -2200,6 +2480,10 @@ void UpdateLatestArtifacts(const cv::Mat& image,
     cv::imwrite(BuildLatestRgbPath(), rgbPanel);
     cv::imwrite(BuildLatestDepthPath(), depthPanel);
     cv::imwrite(BuildLatestMapPath(), mapPanel);
+    if(!modelDepthPanel.empty())
+        cv::imwrite(BuildLatestModelDepthPath(), modelDepthPanel);
+    if(!depthDiffPanel.empty())
+        cv::imwrite(BuildLatestDepthDiffPath(), depthDiffPanel);
 }
 
 }  // namespace
@@ -2217,6 +2501,9 @@ int main(int argc, char** argv) {
     const bool appMode = GetEnvFlag("ORB_NAV_APP_MODE");
     const string controlPath = GetEnvOrDefault("ORB_NAV_CONTROL_PATH", "/tmp/iphone_rgbd_nav_control.json");
     const string statePath = GetEnvOrDefault("ORB_NAV_STATE_PATH", "/tmp/iphone_rgbd_nav_state.json");
+#ifdef __APPLE__
+    const string depthModelPath = GetEnvOrDefault("ORB_NAV_DEPTH_MODEL_PATH", "models/DepthAnythingV2SmallF16.mlpackage");
+#endif
 
     struct sigaction sigIntHandler {};
     sigIntHandler.sa_handler = ExitLoopHandler;
@@ -2244,8 +2531,19 @@ int main(int argc, char** argv) {
     NavigationSettings navigationSettings;
     GuidanceState guidanceState;
     ScaleDiagnostics scaleDiagnostics;
+    DepthComparisonDiagnostics depthComparison;
     MouseContext mouseContext{&viewState, &planner, grid.resolution()};
     int lastControlRevision = -1;
+
+#ifdef __APPLE__
+    std::unique_ptr<CoreMLDepthEstimator> depthEstimator;
+    depthComparison.modelEnabled = true;
+    depthEstimator = std::make_unique<CoreMLDepthEstimator>(depthModelPath);
+    depthComparison.modelReady = depthEstimator->IsReady();
+    depthComparison.status = depthComparison.modelReady ? "READY" : "MODEL_UNAVAILABLE";
+    if(!depthComparison.modelReady)
+        cerr << "Depth comparison model unavailable: " << depthEstimator->Error() << endl;
+#endif
 
     if(!appMode) {
         cv::namedWindow(kWindowName, cv::WINDOW_AUTOSIZE);
@@ -2254,6 +2552,8 @@ int main(int argc, char** argv) {
 
     cv::Mat lastRgbPanel;
     cv::Mat lastDepthPanel;
+    cv::Mat lastModelDepthPanel;
+    cv::Mat lastDepthDiffPanel;
     unique_ptr<ORB_SLAM3::System> slam;
     float imageScale = 1.0f;
     bool localizationOnly = false;
@@ -2261,6 +2561,10 @@ int main(int argc, char** argv) {
     while(gKeepRunning) {
         cv::Mat waitingRgb = lastRgbPanel.empty() ? cv::Mat(860, 320, CV_8UC3, cv::Scalar(18, 18, 18)) : lastRgbPanel;
         cv::Mat waitingDepth = lastDepthPanel.empty() ? cv::Mat(860, 320, CV_8UC3, cv::Scalar(20, 20, 20)) : lastDepthPanel;
+        cv::Mat waitingModelDepthExport = lastModelDepthPanel.empty() ? BuildAppPreviewPlaceholder(cv::Size(640, 480), "Small V2 深度", "模型深度会在这里更新")
+                                                                      : lastModelDepthPanel.clone();
+        cv::Mat waitingDepthDiffExport = lastDepthDiffPanel.empty() ? BuildAppPreviewPlaceholder(cv::Size(640, 480), "深度误差", "误差热图会在这里更新")
+                                                                    : lastDepthDiffPanel.clone();
         cv::Mat waitingRgbExport = lastRgbPanel.empty() ? BuildAppPreviewPlaceholder(cv::Size(640, 480), "RGB 预览", "等待 iPhone 视频流")
                                                         : lastRgbPanel.clone();
         cv::Mat waitingDepthExport = lastDepthPanel.empty() ? BuildAppPreviewPlaceholder(cv::Size(640, 480), "深度预览", "深度画面会在这里更新")
@@ -2293,9 +2597,9 @@ int main(int argc, char** argv) {
             DrawOverlayText(waitingComposite, "截图时间 " + CurrentTimeString(),
                             cv::Point(std::max(18, waitingComposite.cols / 2 - 120), 12), cv::Scalar(235, 235, 235), 18, 1);
         }
-        UpdateLatestArtifacts(waitingComposite, waitingRgbExport, waitingDepthExport, waitingMap);
+        UpdateLatestArtifacts(waitingComposite, waitingRgbExport, waitingDepthExport, waitingMap, waitingModelDepthExport, waitingDepthDiffExport);
         WriteMapRenderData(BuildLatestMapDataPath(), grid, viewState, liveStatus, planner, trajectory, navigationSettings);
-        WriteBackendState(statePath, liveStatus, planner, guidanceState, navigationSettings, scaleDiagnostics,
+        WriteBackendState(statePath, liveStatus, planner, guidanceState, navigationSettings, scaleDiagnostics, depthComparison,
                           viewState, viewState.panelRect, waitingComposite.size(), false);
 
         bool requestSnapshot = false;
@@ -2405,6 +2709,51 @@ int main(int argc, char** argv) {
                 cv::resize(slamDepth, slamDepth, cv::Size(scaledWidth, scaledHeight), 0.0, 0.0, cv::INTER_NEAREST);
             }
 
+            cv::Mat modelDepthPreview;
+            cv::Mat depthDiffPreview;
+            cv::Mat alignedModelDepthMeters;
+            cv::Mat depthErrorMeters;
+            cv::Mat depthCompareMask;
+#ifdef __APPLE__
+            {
+                DepthComparisonDiagnostics frameDepthComparison;
+                frameDepthComparison.modelEnabled = true;
+                frameDepthComparison.modelReady = depthEstimator && depthEstimator->IsReady();
+                frameDepthComparison.status = frameDepthComparison.modelReady ? "READY" : "MODEL_UNAVAILABLE";
+
+                if(frameDepthComparison.modelReady) {
+                    cv::Mat modelDepth32f;
+                    double inferenceMs = 0.0;
+                    if(depthEstimator->Infer(currentFrame.rgb, modelDepth32f, inferenceMs)) {
+                        cv::Mat modelDepthAtSensor;
+                        cv::resize(modelDepth32f, modelDepthAtSensor, currentFrame.depthMm.size(), 0.0, 0.0, cv::INTER_LINEAR);
+                        modelDepthPreview = RotateForPreview(ColorizeDepthFloat(modelDepthAtSensor), currentFrame.header.displayOrientation);
+
+                        frameDepthComparison = CompareDepthMaps(currentFrame.depthMm, modelDepthAtSensor,
+                                                                alignedModelDepthMeters, depthErrorMeters, depthCompareMask);
+                        frameDepthComparison.modelEnabled = true;
+                        frameDepthComparison.modelReady = true;
+                        frameDepthComparison.inferenceMs = static_cast<float>(inferenceMs);
+                        frameDepthComparison.status = frameDepthComparison.hasComparison ? "READY" : "INSUFFICIENT_OVERLAP";
+
+                        if(frameDepthComparison.hasComparison) {
+                            modelDepthPreview = RotateForPreview(
+                                ColorizeDepthFloat(alignedModelDepthMeters, depthCompareMask),
+                                currentFrame.header.displayOrientation);
+                            depthDiffPreview = RotateForPreview(
+                                ColorizeDepthError(depthErrorMeters, depthCompareMask),
+                                currentFrame.header.displayOrientation);
+                        }
+                    } else {
+                        frameDepthComparison.status = "INFERENCE_FAILED";
+                    }
+                }
+                depthComparison = frameDepthComparison;
+            }
+#else
+            depthComparison = DepthComparisonDiagnostics{};
+#endif
+
             const float scaleX = static_cast<float>(slamRgb.cols) / static_cast<float>(currentFrame.header.rgbWidth);
             const float scaleY = static_cast<float>(slamRgb.rows) / static_cast<float>(currentFrame.header.rgbHeight);
             const float fx = (currentFrame.header.fx * static_cast<float>(currentFrame.header.rgbWidth) / static_cast<float>(currentFrame.header.depthWidth)) * scaleX;
@@ -2469,6 +2818,13 @@ int main(int argc, char** argv) {
                     depthText << "状态 " << liveStatus.trackingState;
                     DrawLabel(depthPanel, depthText.str(), cv::Point(10, 54));
                 }
+                if(depthComparison.hasComparison) {
+                    ostringstream compareText;
+                    compareText << fixed << setprecision(3)
+                                << "Small V2 MAE " << depthComparison.maeMeters << "m"
+                                << "  RMSE " << depthComparison.rmseMeters << "m";
+                    DrawLabel(depthPanel, compareText.str(), cv::Point(10, 98));
+                }
             }
 
             cv::Mat mapPanel(860, 940, CV_8UC3);
@@ -2478,6 +2834,8 @@ int main(int argc, char** argv) {
 
             lastRgbPanel = rgbPreview.clone();
             lastDepthPanel = depthPreview.clone();
+            lastModelDepthPanel = modelDepthPreview.clone();
+            lastDepthDiffPanel = depthDiffPreview.clone();
 
             cv::Mat composite = BuildComposite(rgbPanel, depthPanel, mapPanel, viewState, appMode);
             if(!appMode) {
@@ -2486,9 +2844,9 @@ int main(int argc, char** argv) {
                 DrawOverlayText(composite, "截图时间 " + CurrentTimeString(),
                                 cv::Point(std::max(18, composite.cols / 2 - 120), 12), cv::Scalar(235, 235, 235), 18, 1);
             }
-            UpdateLatestArtifacts(composite, rgbPreview, depthPreview, mapPanel);
+            UpdateLatestArtifacts(composite, rgbPreview, depthPreview, mapPanel, modelDepthPreview, depthDiffPreview);
             WriteMapRenderData(BuildLatestMapDataPath(), grid, viewState, liveStatus, planner, trajectory, navigationSettings);
-            WriteBackendState(statePath, liveStatus, planner, guidanceState, navigationSettings, scaleDiagnostics,
+            WriteBackendState(statePath, liveStatus, planner, guidanceState, navigationSettings, scaleDiagnostics, depthComparison,
                               viewState, viewState.panelRect, composite.size(), true);
 
             bool requestSnapshot = false;
