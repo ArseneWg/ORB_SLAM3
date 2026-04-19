@@ -21,9 +21,17 @@ struct InspectorView: View {
                 ) {
                     DetailRow(label: "连接", value: model.runtimeState?.connected == true ? "在线" : "等待")
                     DetailRow(label: "跟踪", value: model.runtimeState?.trackingState ?? "未知")
+                    DetailRow(label: "深度模式", value: depthModeLabel)
+                    DetailRow(label: "当前生效", value: depthActiveLabel)
                     DetailRow(label: "地面高度", value: metric(model.runtimeState?.floorY))
                     DetailRow(label: "视图模式", value: viewModeLabel)
                     DetailRow(label: "定位模式", value: model.runtimeState?.localizationOnly == true ? "纯定位" : "建图")
+                    if let status = model.runtimeState?.depthSourceStatus, !status.isEmpty {
+                        Text(status)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     if let lastStateLoadedAt = model.lastStateLoadedAt {
                         DetailRow(label: "状态刷新", value: lastStateLoadedAt.formatted(date: .omitted, time: .standard))
                     }
@@ -168,6 +176,34 @@ struct InspectorView: View {
         return "未设置目标"
     }
 
+    private var depthModeLabel: String {
+        guard let raw = model.runtimeState?.depthSourceMode,
+              let mode = DepthSourceModeOption(rawValue: raw) else { return "--" }
+        return mode.title
+    }
+
+    private var depthActiveLabel: String {
+        let slam: String
+        switch model.runtimeState?.activeSlamDepthSource {
+        case "model":
+            slam = "SLAM 模型"
+        case "none":
+            slam = "SLAM 未更新"
+        default:
+            slam = "SLAM 传感器"
+        }
+        let map: String
+        switch model.runtimeState?.activeMapDepthSource {
+        case "model":
+            map = "地图 模型"
+        case "none":
+            map = "地图 未更新"
+        default:
+            map = "地图 传感器"
+        }
+        return "\(slam) / \(map)"
+    }
+
     private var hoverWorldText: String {
         guard let info = model.mapHoverInfo else { return "--" }
         return String(format: "x %.2f, z %.2f", info.worldX, info.worldZ)
@@ -230,6 +266,7 @@ struct InspectorView: View {
 
     private var depthStatusText: String {
         guard let state = model.runtimeState else { return "--" }
+        if !state.enableDepthComparison { return "已关闭" }
         if !state.depthModelEnabled { return "未启用" }
         if state.depthComparisonReady { return "已完成对比" }
         switch state.depthComparisonStatus {

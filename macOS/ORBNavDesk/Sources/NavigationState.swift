@@ -1,8 +1,39 @@
 import CoreGraphics
 import Foundation
 
-struct NavigationRuntimeState: Codable {
+enum DepthSourceModeOption: String, CaseIterable, Identifiable {
+    case sensor = "sensor"
+    case modelMap = "model_map"
+    case modelFull = "model_full"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .sensor:
+            return "传感器深度"
+        case .modelMap:
+            return "模型仅地图"
+        case .modelFull:
+            return "模型主链+地图"
+        }
+    }
+
+    var note: String {
+        switch self {
+        case .sensor:
+            return "SLAM 与导航图都使用 iPhone 传感器深度。"
+        case .modelMap:
+            return "SLAM 保持传感器深度，2D 地图改用经传感器对齐的模型深度。"
+        case .modelFull:
+            return "SLAM 与 2D 地图都改用经传感器对齐的模型深度。"
+        }
+    }
+}
+
+struct NavigationRuntimeState: Codable, Sendable {
     let timestamp: String
+    let appliedControlRevision: Int?
     let connected: Bool
     let trackingState: String
     let hasPose: Bool
@@ -13,6 +44,14 @@ struct NavigationRuntimeState: Codable {
     let inflationRadiusCells: Int
     let showInflation: Bool
     let lookaheadMeters: Double
+    let depthSourceMode: String?
+    let activeSlamDepthSource: String?
+    let activeMapDepthSource: String?
+    let depthSourceStatus: String?
+    let enableRgbPreview: Bool
+    let enableDepthPreview: Bool
+    let enableDepthComparison: Bool
+    let enableDepthDiffPreview: Bool
     let orbDistanceMeters: Double
     let phoneDistanceMeters: Double
     let scaleRatio: Double
@@ -63,7 +102,7 @@ struct NavigationRuntimeState: Codable {
     }
 }
 
-struct ControlEnvelope: Codable {
+struct ControlEnvelope: Codable, Sendable {
     var revision: Int
     var viewMode: String?
     var clearGoal: Bool?
@@ -75,6 +114,11 @@ struct ControlEnvelope: Codable {
     var showInflation: Bool?
     var lookaheadMeters: Double?
     var localizationOnly: Bool?
+    var depthSourceMode: String?
+    var enableRgbPreview: Bool?
+    var enableDepthPreview: Bool?
+    var enableDepthComparison: Bool?
+    var enableDepthDiffPreview: Bool?
     var setGoal: Bool?
     var goalWorldX: Double?
     var goalWorldZ: Double?

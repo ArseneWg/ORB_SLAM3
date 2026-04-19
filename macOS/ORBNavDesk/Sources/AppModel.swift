@@ -6,6 +6,11 @@ enum DepthComparisonArtifact {
     case depthDiff
 }
 
+private struct LoadedImageData: Sendable {
+    let modified: Date
+    let data: Data
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var runtimeState: NavigationRuntimeState?
@@ -16,6 +21,7 @@ final class AppModel: ObservableObject {
     @Published var mapData: NavigationMapData?
     @Published var logs: String = ""
     @Published var backendRunning = false
+    @Published var backendIssue: String?
 
     @Published var fixedHeightMode = false
     @Published var fixedCameraHeightMeters = 0.30
@@ -23,6 +29,11 @@ final class AppModel: ObservableObject {
     @Published var inflationRadiusCells = 3
     @Published var lookaheadMeters = 0.60
     @Published var localizationOnly = false
+    @Published var depthSourceMode: DepthSourceModeOption = .sensor
+    @Published var enableRgbPreview = false
+    @Published var enableDepthPreview = false
+    @Published var enableDepthComparison = false
+    @Published var enableDepthDiffPreview = false
     @Published var viewMode: String = "follow"
     @Published var mapShowGrid = true
     @Published var mapShowFreeCells = true
@@ -52,6 +63,10 @@ final class AppModel: ObservableObject {
     private var lastDepthDiffImageMTime: Date?
     private var lastMapDataMTime: Date?
     private var lastStateMTime: Date?
+    private var panelLoadTask: Task<Void, Never>?
+    private var mapLoadTask: Task<Void, Never>?
+    private var lastSettingsControlRevision = -1
+    private let stateFreshnessWindow: TimeInterval = 3.0
 
     var latestSnapshotURL: URL? {
         guard let path = runtimeState?.latestImagePath, !path.isEmpty else { return nil }
@@ -89,6 +104,9 @@ final class AppModel: ObservableObject {
     }
 
     var connectionSummary: String {
+        if let backendIssue, !backendIssue.isEmpty {
+            return backendIssue
+        }
         if backendRunning {
             return runtimeState?.connected == true ? "iPhone 已连接" : "等待 iPhone 推流"
         }
@@ -101,6 +119,39 @@ final class AppModel: ObservableObject {
 
     var operationModeSummary: String {
         fixedHeightMode ? "车载固定高度" : "手持自适应"
+    }
+
+    var depthSourceSummary: String {
+        switch runtimeState?.depthSourceMode.flatMap(DepthSourceModeOption.init(rawValue:)) ?? depthSourceMode {
+        case .sensor:
+            return "传感器"
+        case .modelMap:
+            return "地图模型"
+        case .modelFull:
+            return "全链模型"
+        }
+    }
+
+    var activeDepthSourceSummary: String {
+        let slam: String
+        switch runtimeState?.activeSlamDepthSource {
+        case "model":
+            slam = "SLAM 模型"
+        case "none":
+            slam = "SLAM 未更新"
+        default:
+            slam = "SLAM 传感器"
+        }
+        let map: String
+        switch runtimeState?.activeMapDepthSource {
+        case "model":
+            map = "地图 模型"
+        case "none":
+            map = "地图 未更新"
+        default:
+            map = "地图 传感器"
+        }
+        return "\(slam) / \(map)"
     }
 
     var scaleRatioSummary: String {
@@ -119,8 +170,40 @@ final class AppModel: ObservableObject {
         return "未设置"
     }
 
+    var shouldShowRgbPreview: Bool {
+        enableRgbPreview
+    }
+
+    var shouldShowDepthPreview: Bool {
+        enableDepthPreview
+    }
+
+    var shouldShowDepthDiffPreview: Bool {
+        enableDepthComparison && enableDepthDiffPreview
+    }
+
+    var hasVisiblePreviewPanels: Bool {
+        shouldShowRgbPreview || shouldShowDepthPreview || shouldShowDepthDiffPreview
+    }
+
     func start() {
         if backendRunning { return }
+        backendIssue = nil
+
+        if isPortInUse(9000) {
+            if canAdoptExistingBackend() {
+                backendRunning = true
+                backendIssue = nil
+                appendLog("检测到已有 rgbd_iphone_stream 在运行，已接管现有后端。\n")
+                startPolling()
+                refreshNow()
+                return
+            }
+            backendIssue = "端口 9000 被占用"
+            appendLog("无法启动后端：端口 9000 已被其他 rgbd_iphone_stream 实例占用。请先停止已有后端。\n")
+            refreshNow()
+            return
+        }
 
         let process = Process()
         process.currentDirectoryURL = workspaceRoot
@@ -153,10 +236,16 @@ final class AppModel: ObservableObject {
             }
         }
 
-        process.terminationHandler = { [weak self] _ in
+        process.terminationHandler = { [weak self] terminatedProcess in
             Task { @MainActor in
+                let status = terminatedProcess.terminationStatus
                 self?.cleanupProcessState()
-                self?.appendLog("Backend exited.\n")
+                if status != 0 {
+                    self?.backendIssue = "后端启动失败"
+                    self?.appendLog("Backend exited with status \(status).\n")
+                } else {
+                    self?.appendLog("Backend exited.\n")
+                }
             }
         }
 
@@ -166,11 +255,13 @@ final class AppModel: ObservableObject {
             self.stdoutPipe = stdout
             self.stderrPipe = stderr
             self.backendRunning = true
+            self.backendIssue = nil
             appendLog("Started backend in app mode.\n")
             startPolling()
             sendControl()
             refreshNow()
         } catch {
+            backendIssue = "后端启动失败"
             appendLog("Failed to start backend: \(error.localizedDescription)\n")
         }
     }
@@ -252,7 +343,13 @@ final class AppModel: ObservableObject {
     }
 
     func refreshNow() {
+        refreshBackendAvailability()
         pollFiles()
+    }
+
+    func bootstrap() {
+        startPolling()
+        refreshNow()
     }
 
     func clearLogs() {
@@ -265,17 +362,30 @@ final class AppModel: ObservableObject {
 
     func syncSettingsFromRuntime() {
         guard let state = runtimeState else { return }
-        fixedHeightMode = state.fixedHeightMode
-        fixedCameraHeightMeters = state.fixedCameraHeightMeters
-        showInflation = state.showInflation
-        inflationRadiusCells = state.inflationRadiusCells
-        lookaheadMeters = state.lookaheadMeters
-        localizationOnly = state.localizationOnly
+        let appliedRevision = state.appliedControlRevision ?? -1
+        let runtimeCaughtUp = appliedRevision >= lastSettingsControlRevision
+
+        if runtimeCaughtUp {
+            fixedHeightMode = state.fixedHeightMode
+            fixedCameraHeightMeters = state.fixedCameraHeightMeters
+            showInflation = state.showInflation
+            inflationRadiusCells = state.inflationRadiusCells
+            lookaheadMeters = state.lookaheadMeters
+            localizationOnly = state.localizationOnly
+            if let mode = state.depthSourceMode.flatMap(DepthSourceModeOption.init(rawValue:)) {
+                depthSourceMode = mode
+            }
+            enableRgbPreview = state.enableRgbPreview
+            enableDepthPreview = state.enableDepthPreview
+            enableDepthComparison = state.enableDepthComparison
+            enableDepthDiffPreview = state.enableDepthDiffPreview
+        }
         viewMode = state.followRobot ? "follow" : (state.autoFit ? "overview" : "manual")
     }
 
     func sendControl() {
         controlRevision += 1
+        lastSettingsControlRevision = controlRevision
         let payload = ControlEnvelope(
             revision: controlRevision,
             viewMode: viewMode,
@@ -288,6 +398,11 @@ final class AppModel: ObservableObject {
             showInflation: showInflation,
             lookaheadMeters: lookaheadMeters,
             localizationOnly: localizationOnly,
+            depthSourceMode: depthSourceMode.rawValue,
+            enableRgbPreview: enableRgbPreview,
+            enableDepthPreview: enableDepthPreview,
+            enableDepthComparison: enableDepthComparison,
+            enableDepthDiffPreview: enableDepthDiffPreview,
             setGoal: false,
             goalWorldX: nil,
             goalWorldZ: nil
@@ -309,6 +424,11 @@ final class AppModel: ObservableObject {
             showInflation: showInflation,
             lookaheadMeters: lookaheadMeters,
             localizationOnly: localizationOnly,
+            depthSourceMode: depthSourceMode.rawValue,
+            enableRgbPreview: enableRgbPreview,
+            enableDepthPreview: enableDepthPreview,
+            enableDepthComparison: enableDepthComparison,
+            enableDepthDiffPreview: enableDepthDiffPreview,
             setGoal: false,
             goalWorldX: nil,
             goalWorldZ: nil
@@ -327,8 +447,8 @@ final class AppModel: ObservableObject {
     }
 
     private func startPolling() {
-        pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+        if pollTimer != nil { return }
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.18, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.pollFiles()
             }
@@ -338,6 +458,10 @@ final class AppModel: ObservableObject {
     private func stopPolling() {
         pollTimer?.invalidate()
         pollTimer = nil
+        panelLoadTask?.cancel()
+        panelLoadTask = nil
+        mapLoadTask?.cancel()
+        mapLoadTask = nil
     }
 
     private func pollFiles() {
@@ -358,6 +482,7 @@ final class AppModel: ObservableObject {
             let state = try JSONDecoder().decode(NavigationRuntimeState.self, from: data)
             runtimeState = state
             lastStateLoadedAt = modified
+            refreshBackendAvailability(using: modified)
             syncSettingsFromRuntime()
         } catch {
             appendLog("Failed to decode runtime state: \(error.localizedDescription)\n")
@@ -371,38 +496,101 @@ final class AppModel: ObservableObject {
               let modified = attributes[.modificationDate] as? Date else { return }
         if let lastImageMTime, modified <= lastImageMTime { return }
         lastImageMTime = modified
-        latestImage = NSImage(contentsOf: imageURL)
+        latestImage = nil
         lastImageLoadedAt = modified
     }
 
     private func loadPanelImagesIfNeeded() {
-        loadImage(at: latestRgbURL, lastModified: &lastRgbImageMTime, assign: { latestRgbImage = $0 })
-        loadImage(at: latestDepthURL, lastModified: &lastDepthImageMTime, assign: { latestDepthImage = $0 })
-        loadImage(at: latestDepthDiffURL, lastModified: &lastDepthDiffImageMTime, assign: { latestDepthDiffImage = $0 })
-    }
+        if !shouldShowRgbPreview {
+            latestRgbImage = nil
+            lastRgbImageMTime = nil
+        }
+        if !shouldShowDepthPreview {
+            latestDepthImage = nil
+            lastDepthImageMTime = nil
+        }
+        if !shouldShowDepthDiffPreview {
+            latestDepthDiffImage = nil
+            lastDepthDiffImageMTime = nil
+        }
 
-    private func loadMapDataIfNeeded() {
-        guard let url = mapDataURL,
-              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let modified = attributes[.modificationDate] as? Date else { return }
-        if let lastMapDataMTime, modified <= lastMapDataMTime { return }
-        lastMapDataMTime = modified
+        guard panelLoadTask == nil else { return }
 
-        do {
-            let data = try Data(contentsOf: url)
-            mapData = try JSONDecoder().decode(NavigationMapData.self, from: data)
-        } catch {
-            appendLog("Failed to decode map data: \(error.localizedDescription)\n")
+        let rgbURL = shouldShowRgbPreview ? latestRgbURL : nil
+        let depthURL = shouldShowDepthPreview ? latestDepthURL : nil
+        let diffURL = shouldShowDepthDiffPreview ? latestDepthDiffURL : nil
+        let lastRgb = lastRgbImageMTime
+        let lastDepth = lastDepthImageMTime
+        let lastDiff = lastDepthDiffImageMTime
+
+        panelLoadTask = Task.detached(priority: .utility) { [rgbURL, depthURL, diffURL, lastRgb, lastDepth, lastDiff] in
+            let rgbResult = Self.loadImageDataIfNeeded(at: rgbURL, previousModified: lastRgb)
+            let depthResult = Self.loadImageDataIfNeeded(at: depthURL, previousModified: lastDepth)
+            let diffResult = Self.loadImageDataIfNeeded(at: diffURL, previousModified: lastDiff)
+
+            await MainActor.run {
+                if let rgbResult {
+                    self.lastRgbImageMTime = rgbResult.modified
+                    if self.shouldShowRgbPreview {
+                        self.latestRgbImage = NSImage(data: rgbResult.data)
+                    }
+                }
+                if let depthResult {
+                    self.lastDepthImageMTime = depthResult.modified
+                    if self.shouldShowDepthPreview {
+                        self.latestDepthImage = NSImage(data: depthResult.data)
+                    }
+                }
+                if let diffResult {
+                    self.lastDepthDiffImageMTime = diffResult.modified
+                    if self.shouldShowDepthDiffPreview {
+                        self.latestDepthDiffImage = NSImage(data: diffResult.data)
+                    }
+                }
+                self.panelLoadTask = nil
+            }
         }
     }
 
-    private func loadImage(at url: URL?, lastModified: inout Date?, assign: (NSImage?) -> Void) {
+    private func loadMapDataIfNeeded() {
+        guard mapLoadTask == nil, let url = mapDataURL else { return }
+        let lastModified = lastMapDataMTime
+
+        mapLoadTask = Task.detached(priority: .utility) { [url, lastModified] in
+            do {
+                guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                      let modified = attributes[.modificationDate] as? Date else {
+                    await MainActor.run { self.mapLoadTask = nil }
+                    return
+                }
+                if let lastModified, modified <= lastModified {
+                    await MainActor.run { self.mapLoadTask = nil }
+                    return
+                }
+
+                let data = try Data(contentsOf: url)
+                let decoded = try JSONDecoder().decode(NavigationMapData.self, from: data)
+                await MainActor.run {
+                    self.lastMapDataMTime = modified
+                    self.mapData = decoded
+                    self.mapLoadTask = nil
+                }
+            } catch {
+                await MainActor.run {
+                    self.appendLog("Failed to decode map data: \(error.localizedDescription)\n")
+                    self.mapLoadTask = nil
+                }
+            }
+        }
+    }
+
+    nonisolated private static func loadImageDataIfNeeded(at url: URL?, previousModified: Date?) -> LoadedImageData? {
         guard let url,
               let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let modified = attributes[.modificationDate] as? Date else { return }
-        if let lastModified, modified <= lastModified { return }
-        lastModified = modified
-        assign(NSImage(contentsOf: url))
+              let modified = attributes[.modificationDate] as? Date else { return nil }
+        if let previousModified, modified <= previousModified { return nil }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return LoadedImageData(modified: modified, data: data)
     }
 
     private func cleanupProcessState() {
@@ -413,6 +601,54 @@ final class AppModel: ObservableObject {
         process = nil
         backendRunning = false
         stopPolling()
+    }
+
+    private func canAdoptExistingBackend() -> Bool {
+        guard isPortInUse(9000) else { return false }
+        return isStateFresh()
+    }
+
+    private func isStateFresh() -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: statePath.path),
+              let modified = attributes[.modificationDate] as? Date else { return false }
+        return Date().timeIntervalSince(modified) <= stateFreshnessWindow
+    }
+
+    private func refreshBackendAvailability(using stateModified: Date? = nil) {
+        let ownsRunningProcess = process?.isRunning == true
+        let stateLooksFresh: Bool
+        if let stateModified {
+            stateLooksFresh = Date().timeIntervalSince(stateModified) <= stateFreshnessWindow
+        } else {
+            stateLooksFresh = isStateFresh()
+        }
+        let externalBackendAvailable = isPortInUse(9000) && stateLooksFresh
+        backendRunning = ownsRunningProcess || externalBackendAvailable
+        if backendRunning, backendIssue == "后端启动失败" {
+            backendIssue = nil
+        }
+        if backendRunning {
+            startPolling()
+        }
+    }
+
+    nonisolated private func isPortInUse(_ port: Int) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard process.terminationStatus == 0 else { return false }
+            let output = String(decoding: data, as: UTF8.self)
+            return output.contains("rgbd_iphone_stream") || output.contains("run_iphone_rgbd_orbslam3.sh")
+        } catch {
+            return false
+        }
     }
 
     private func appendLog(_ text: String) {

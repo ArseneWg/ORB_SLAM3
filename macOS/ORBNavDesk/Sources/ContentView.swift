@@ -83,7 +83,7 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            model.start()
+            model.bootstrap()
         }
     }
 }

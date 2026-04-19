@@ -60,6 +60,72 @@ struct SidebarPanel: View {
                             .onChange(of: model.localizationOnly) { _, _ in
                                 model.sendControl()
                             }
+
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("深度来源")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+
+                            Picker("深度来源", selection: $model.depthSourceMode) {
+                                ForEach(DepthSourceModeOption.allCases) { option in
+                                    Text(option.title).tag(option)
+                                }
+                            }
+                            .pickerStyle(.radioGroup)
+                            .labelsHidden()
+                            .onChange(of: model.depthSourceMode) { _, _ in
+                                model.sendControl()
+                            }
+
+                            Text(model.depthSourceMode.note)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            Text("说明：当前模型模式仍会借助 iPhone 深度做尺度对齐，所以它适合做替代能力评估，不等同于完全无真深度硬件。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+
+                PanelCard(title: "预览与诊断", subtitle: "默认保持轻量运行，需要时再打开辅助预览和误差对比") {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Toggle("显示 RGB 预览", isOn: $model.enableRgbPreview)
+                            .toggleStyle(.switch)
+                            .onChange(of: model.enableRgbPreview) { _, _ in
+                                model.sendControl()
+                            }
+
+                        Toggle("显示深度预览", isOn: $model.enableDepthPreview)
+                            .toggleStyle(.switch)
+                            .onChange(of: model.enableDepthPreview) { _, _ in
+                                model.sendControl()
+                            }
+
+                        Toggle("启用 Small V2 深度对比", isOn: $model.enableDepthComparison)
+                            .toggleStyle(.switch)
+                            .onChange(of: model.enableDepthComparison) { _, isEnabled in
+                                if !isEnabled {
+                                    model.enableDepthDiffPreview = false
+                                }
+                                model.sendControl()
+                            }
+
+                        Toggle("显示误差热图", isOn: $model.enableDepthDiffPreview)
+                            .toggleStyle(.switch)
+                            .disabled(!model.enableDepthComparison)
+                            .onChange(of: model.enableDepthDiffPreview) { _, _ in
+                                model.sendControl()
+                            }
+
+                        Text("说明：RGB/深度预览关闭后，App 不再主动读取这些面板；Small V2 对比关闭后，后端也会跳过这条旁路计算。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 

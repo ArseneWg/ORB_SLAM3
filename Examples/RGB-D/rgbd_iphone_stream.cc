@@ -27,11 +27,13 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <condition_variable>
 #include <ctime>
 #include <unordered_map>
 #include <vector>
@@ -65,6 +67,11 @@ constexpr float kFloorClearanceMeters = 0.05f;
 constexpr float kObstacleHeightMeters = 1.10f;
 constexpr float kAssumedCameraHeightMeters = 0.30f;
 constexpr bool kLoadAtlasOnColdStart = false;
+constexpr auto kAppLatestArtifactsInterval = chrono::milliseconds(150);
+constexpr auto kDefaultLatestArtifactsInterval = chrono::seconds(2);
+constexpr auto kAppMapDataInterval = chrono::milliseconds(180);
+constexpr auto kDefaultMapDataInterval = chrono::milliseconds(750);
+constexpr int kSensorModeModelEvalStride = 5;
 
 atomic<bool> gKeepRunning{true};
 
@@ -177,12 +184,23 @@ struct ScaleDiagnostics {
     uint64_t phoneSegments = 0;
 };
 
+enum class DepthSourceMode {
+    Sensor,
+    ModelMap,
+    ModelFull
+};
+
 struct NavigationSettings {
     bool fixedHeightMode = false;
     float fixedCameraHeightMeters = kAssumedCameraHeightMeters;
     int inflationRadiusCells = 3;
     float lookaheadMeters = 0.60f;
     bool showInflation = true;
+    bool enableRgbPreview = false;
+    bool enableDepthPreview = false;
+    bool enableDepthComparison = false;
+    bool enableDepthDiffPreview = false;
+    DepthSourceMode depthSourceMode = DepthSourceMode::Sensor;
 };
 
 struct GuidanceState {
@@ -213,6 +231,13 @@ struct DepthComparisonDiagnostics {
     float biasMeters = 0.0f;
 };
 
+struct DepthSourceState {
+    string requestedMode = "sensor";
+    string activeSlamSource = "sensor";
+    string activeMapSource = "sensor";
+    string status = "传感器深度";
+};
+
 struct BackendControl {
     int revision = -1;
     string viewMode;
@@ -231,9 +256,179 @@ struct BackendControl {
     float lookaheadMeters = 0.60f;
     bool hasLocalizationOnly = false;
     bool localizationOnly = false;
+    bool hasDepthSourceMode = false;
+    DepthSourceMode depthSourceMode = DepthSourceMode::Sensor;
+    bool hasEnableRgbPreview = false;
+    bool enableRgbPreview = false;
+    bool hasEnableDepthPreview = false;
+    bool enableDepthPreview = false;
+    bool hasEnableDepthComparison = false;
+    bool enableDepthComparison = false;
+    bool hasEnableDepthDiffPreview = false;
+    bool enableDepthDiffPreview = false;
     bool setGoal = false;
     float goalWorldX = 0.0f;
     float goalWorldZ = 0.0f;
+};
+
+string CurrentTimeString();
+string JsonEscape(const string& input);
+string BuildLatestSnapshotPath();
+string BuildLatestRgbPath();
+string BuildLatestDepthPath();
+string BuildLatestMapPath();
+string BuildLatestModelDepthPath();
+string BuildLatestDepthDiffPath();
+void WriteCellJsonArray(ostream& out, const string& key, const vector<GridKey>& cells, bool trailingComma);
+void WriteWorldPointJsonArray(ostream& out, const string& key, const vector<cv::Point2f>& points, bool trailingComma);
+
+struct LatestArtifactsPayload {
+    cv::Mat image;
+    cv::Mat rgbPanel;
+    cv::Mat depthPanel;
+    cv::Mat mapPanel;
+    cv::Mat modelDepthPanel;
+    cv::Mat depthDiffPanel;
+    NavigationSettings settings;
+};
+
+struct MapRenderPayload {
+    string path;
+    float resolution = kGridResolutionMeters;
+    float metersPerPixel = 0.03f;
+    float viewCenterX = 0.0f;
+    float viewCenterZ = 0.0f;
+    bool showInflation = true;
+    int inflationRadiusCells = 3;
+    bool hasPose = false;
+    Eigen::Vector3f robotPosition = Eigen::Vector3f::Zero();
+    Eigen::Vector3f robotForward = Eigen::Vector3f(0.0f, 0.0f, 1.0f);
+    bool hasGoal = false;
+    cv::Point2f goalWorld;
+    vector<GridKey> freeCells;
+    vector<GridKey> occupiedCells;
+    vector<GridKey> inflatedCells;
+    vector<cv::Point2f> trajectorySamples;
+    vector<cv::Point2f> pathPoints;
+};
+
+class AsyncRenderWriter {
+public:
+    AsyncRenderWriter() : mWorker([this] { Run(); }) {}
+
+    ~AsyncRenderWriter() {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mStop = true;
+        }
+        mCondition.notify_one();
+        if(mWorker.joinable())
+            mWorker.join();
+    }
+
+    void SubmitLatestArtifacts(LatestArtifactsPayload payload) {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mLatestArtifacts = std::move(payload);
+            mHasLatestArtifacts = true;
+        }
+        mCondition.notify_one();
+    }
+
+    void SubmitMapRender(MapRenderPayload payload) {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mLatestMapRender = std::move(payload);
+            mHasLatestMapRender = true;
+        }
+        mCondition.notify_one();
+    }
+
+private:
+    std::mutex mMutex;
+    std::condition_variable mCondition;
+    LatestArtifactsPayload mLatestArtifacts;
+    MapRenderPayload mLatestMapRender;
+    bool mHasLatestArtifacts = false;
+    bool mHasLatestMapRender = false;
+    bool mStop = false;
+    std::thread mWorker;
+
+    static void WriteLatestArtifactsNow(const LatestArtifactsPayload& payload) {
+        cv::imwrite(BuildLatestSnapshotPath(), payload.image);
+        if(payload.settings.enableRgbPreview && !payload.rgbPanel.empty())
+            cv::imwrite(BuildLatestRgbPath(), payload.rgbPanel);
+        if(payload.settings.enableDepthPreview && !payload.depthPanel.empty())
+            cv::imwrite(BuildLatestDepthPath(), payload.depthPanel);
+        cv::imwrite(BuildLatestMapPath(), payload.mapPanel);
+        if(payload.settings.enableDepthComparison && !payload.modelDepthPanel.empty())
+            cv::imwrite(BuildLatestModelDepthPath(), payload.modelDepthPanel);
+        if(payload.settings.enableDepthComparison && payload.settings.enableDepthDiffPreview && !payload.depthDiffPanel.empty())
+            cv::imwrite(BuildLatestDepthDiffPath(), payload.depthDiffPanel);
+    }
+
+    static void WriteMapRenderDataNow(const MapRenderPayload& payload) {
+        ofstream out(payload.path);
+        if(!out.good())
+            return;
+
+        out << "{\n";
+        out << "  \"timestamp\": \"" << JsonEscape(CurrentTimeString()) << "\",\n";
+        out << "  \"resolution\": " << fixed << setprecision(4) << payload.resolution << ",\n";
+        out << "  \"metersPerPixel\": " << fixed << setprecision(6) << payload.metersPerPixel << ",\n";
+        out << "  \"viewCenterX\": " << fixed << setprecision(4) << payload.viewCenterX << ",\n";
+        out << "  \"viewCenterZ\": " << fixed << setprecision(4) << payload.viewCenterZ << ",\n";
+        out << "  \"showInflation\": " << (payload.showInflation ? "true" : "false") << ",\n";
+        out << "  \"inflationRadiusCells\": " << payload.inflationRadiusCells << ",\n";
+        out << "  \"hasPose\": " << (payload.hasPose ? "true" : "false") << ",\n";
+        if(payload.hasPose) {
+            out << "  \"robot\": {\"x\": " << fixed << setprecision(4) << payload.robotPosition.x()
+                << ", \"z\": " << fixed << setprecision(4) << payload.robotPosition.z()
+                << ", \"fx\": " << fixed << setprecision(4) << payload.robotForward.x()
+                << ", \"fz\": " << fixed << setprecision(4) << payload.robotForward.z() << "},\n";
+        } else {
+            out << "  \"robot\": null,\n";
+        }
+        if(payload.hasGoal) {
+            out << "  \"goal\": {\"x\": " << fixed << setprecision(4) << payload.goalWorld.x
+                << ", \"z\": " << fixed << setprecision(4) << payload.goalWorld.y << "},\n";
+        } else {
+            out << "  \"goal\": null,\n";
+        }
+        WriteCellJsonArray(out, "freeCells", payload.freeCells, true);
+        WriteCellJsonArray(out, "occupiedCells", payload.occupiedCells, true);
+        WriteCellJsonArray(out, "inflatedCells", payload.inflatedCells, true);
+        WriteWorldPointJsonArray(out, "trajectory", payload.trajectorySamples, true);
+        WriteWorldPointJsonArray(out, "path", payload.pathPoints, false);
+        out << "}\n";
+    }
+
+    void Run() {
+        std::unique_lock<std::mutex> lock(mMutex);
+        while(true) {
+            mCondition.wait(lock, [this] {
+                return mStop || mHasLatestArtifacts || mHasLatestMapRender;
+            });
+
+            const bool hasArtifacts = mHasLatestArtifacts;
+            const bool hasMapRender = mHasLatestMapRender;
+            auto artifacts = std::move(mLatestArtifacts);
+            auto mapRender = std::move(mLatestMapRender);
+            mHasLatestArtifacts = false;
+            mHasLatestMapRender = false;
+            const bool shouldStop = mStop;
+
+            lock.unlock();
+            if(hasArtifacts)
+                WriteLatestArtifactsNow(artifacts);
+            if(hasMapRender)
+                WriteMapRenderDataNow(mapRender);
+            lock.lock();
+
+            if(shouldStop && !mHasLatestArtifacts && !mHasLatestMapRender)
+                break;
+        }
+    }
 };
 
 class OccupancyGrid2D;
@@ -242,6 +437,7 @@ cv::Point WorldToPixel(const OccupancyViewState& view, const cv::Rect& panelRect
 cv::Point2f PixelToWorld(const OccupancyViewState& view, const cv::Rect& panelRect, const cv::Point& pixel);
 bool IsBlockedForPlanning(const OccupancyGrid2D& grid, const GridKey& cell, int inflationRadius);
 string CurrentTimeString();
+string JsonEscape(const string& input);
 string BuildLatestSnapshotPath();
 string BuildLatestRgbPath();
 string BuildLatestDepthPath();
@@ -270,6 +466,42 @@ Sophus::SE3f PoseFromHeader(const PacketHeader& header) {
 
 float ClampFloat(float value, float minValue, float maxValue) {
     return std::max(minValue, std::min(value, maxValue));
+}
+
+string DepthSourceModeKey(DepthSourceMode mode) {
+    switch(mode) {
+        case DepthSourceMode::Sensor:
+            return "sensor";
+        case DepthSourceMode::ModelMap:
+            return "model_map";
+        case DepthSourceMode::ModelFull:
+            return "model_full";
+    }
+    return "sensor";
+}
+
+DepthSourceMode DepthSourceModeFromKey(const string& key) {
+    if(key == "model_map")
+        return DepthSourceMode::ModelMap;
+    if(key == "model_full")
+        return DepthSourceMode::ModelFull;
+    return DepthSourceMode::Sensor;
+}
+
+string DepthSourceModeLabel(DepthSourceMode mode) {
+    switch(mode) {
+        case DepthSourceMode::Sensor:
+            return "传感器深度";
+        case DepthSourceMode::ModelMap:
+            return "模型深度仅地图";
+        case DepthSourceMode::ModelFull:
+            return "模型深度主链+地图";
+    }
+    return "传感器深度";
+}
+
+bool DepthSourceUsesModelForSlam(DepthSourceMode mode) {
+    return mode == DepthSourceMode::ModelFull;
 }
 
 string GetEnvOrDefault(const char* name, const string& fallback) {
@@ -555,6 +787,31 @@ private:
     Eigen::Quaternionf mOrbToNav = Eigen::Quaternionf::Identity();
 };
 
+void ResetNavigationExperimentState(OccupancyGrid2D& grid,
+                                    PlannerState& planner,
+                                    TrajectoryState& trajectory,
+                                    FloorEstimator& floorEstimator,
+                                    NavigationFrameEstimator& navFrameEstimator,
+                                    ScaleDiagnostics& scaleDiagnostics,
+                                    GuidanceState& guidanceState,
+                                    DepthComparisonDiagnostics& depthComparison,
+                                    LiveStatus& liveStatus,
+                                    OccupancyViewState& viewState,
+                                    bool localizationOnly) {
+    const float resolution = grid.resolution();
+    grid = OccupancyGrid2D(resolution);
+    planner = PlannerState{};
+    trajectory = TrajectoryState{};
+    floorEstimator = FloorEstimator{};
+    navFrameEstimator = NavigationFrameEstimator{};
+    scaleDiagnostics = ScaleDiagnostics{};
+    guidanceState = GuidanceState{};
+    depthComparison = DepthComparisonDiagnostics{};
+    liveStatus = LiveStatus{};
+    liveStatus.localizationOnly = localizationOnly;
+    ResetFollowView(viewState);
+}
+
 void UpdateScaleDiagnostics(ScaleDiagnostics& diagnostics,
                             const Sophus::SE3f& orbTwc,
                             const PacketHeader& phoneHeader) {
@@ -699,6 +956,26 @@ bool ReadBackendControl(const string& path, BackendControl& control) {
             control.hasLocalizationOnly = true;
             control.localizationOnly = *value;
         }
+        if(const auto value = tree.get_optional<string>("depthSourceMode")) {
+            control.hasDepthSourceMode = true;
+            control.depthSourceMode = DepthSourceModeFromKey(*value);
+        }
+        if(const auto value = tree.get_optional<bool>("enableRgbPreview")) {
+            control.hasEnableRgbPreview = true;
+            control.enableRgbPreview = *value;
+        }
+        if(const auto value = tree.get_optional<bool>("enableDepthPreview")) {
+            control.hasEnableDepthPreview = true;
+            control.enableDepthPreview = *value;
+        }
+        if(const auto value = tree.get_optional<bool>("enableDepthComparison")) {
+            control.hasEnableDepthComparison = true;
+            control.enableDepthComparison = *value;
+        }
+        if(const auto value = tree.get_optional<bool>("enableDepthDiffPreview")) {
+            control.hasEnableDepthDiffPreview = true;
+            control.enableDepthDiffPreview = *value;
+        }
         if(const auto value = tree.get_optional<bool>("setGoal")) {
             control.setGoal = *value;
         }
@@ -718,6 +995,8 @@ void ApplyBackendControl(const BackendControl& control,
                          OccupancyGrid2D& grid,
                          bool& localizationOnly,
                          ORB_SLAM3::System* slam,
+                         bool& requestExperimentReset,
+                         bool& requestSlamRestart,
                          bool& requestSnapshot,
                          bool& requestQuit) {
     if(control.viewMode == "follow")
@@ -735,6 +1014,20 @@ void ApplyBackendControl(const BackendControl& control,
         navigationSettings.showInflation = control.showInflation;
     if(control.hasLookaheadMeters)
         navigationSettings.lookaheadMeters = ClampFloat(control.lookaheadMeters, 0.20f, 3.00f);
+    if(control.hasEnableRgbPreview)
+        navigationSettings.enableRgbPreview = control.enableRgbPreview;
+    if(control.hasEnableDepthPreview)
+        navigationSettings.enableDepthPreview = control.enableDepthPreview;
+    if(control.hasEnableDepthComparison)
+        navigationSettings.enableDepthComparison = control.enableDepthComparison;
+    if(control.hasEnableDepthDiffPreview)
+        navigationSettings.enableDepthDiffPreview = control.enableDepthDiffPreview && navigationSettings.enableDepthComparison;
+    if(control.hasDepthSourceMode && control.depthSourceMode != navigationSettings.depthSourceMode) {
+        requestExperimentReset = true;
+        requestSlamRestart = DepthSourceUsesModelForSlam(control.depthSourceMode) !=
+                             DepthSourceUsesModelForSlam(navigationSettings.depthSourceMode);
+        navigationSettings.depthSourceMode = control.depthSourceMode;
+    }
 
     if(control.hasLocalizationOnly && control.localizationOnly != localizationOnly) {
         localizationOnly = control.localizationOnly;
@@ -773,8 +1066,10 @@ void WriteBackendState(const string& path,
                        const PlannerState& planner,
                        const GuidanceState& guidance,
                        const NavigationSettings& navigationSettings,
+                       const DepthSourceState& depthSourceState,
                        const ScaleDiagnostics& diagnostics,
                        const DepthComparisonDiagnostics& depthComparison,
+                       int appliedControlRevision,
                        const OccupancyViewState& viewState,
                        const cv::Rect& mapRect,
                        const cv::Size& compositeSize,
@@ -785,6 +1080,7 @@ void WriteBackendState(const string& path,
 
     out << "{\n";
     out << "  \"timestamp\": \"" << CurrentTimeString() << "\",\n";
+    out << "  \"appliedControlRevision\": " << appliedControlRevision << ",\n";
     out << "  \"connected\": " << (connected ? "true" : "false") << ",\n";
     out << "  \"trackingState\": \"" << status.trackingState << "\",\n";
     out << "  \"hasPose\": " << (status.hasPose ? "true" : "false") << ",\n";
@@ -795,6 +1091,14 @@ void WriteBackendState(const string& path,
     out << "  \"inflationRadiusCells\": " << navigationSettings.inflationRadiusCells << ",\n";
     out << "  \"showInflation\": " << (navigationSettings.showInflation ? "true" : "false") << ",\n";
     out << "  \"lookaheadMeters\": " << fixed << setprecision(3) << navigationSettings.lookaheadMeters << ",\n";
+    out << "  \"depthSourceMode\": \"" << depthSourceState.requestedMode << "\",\n";
+    out << "  \"activeSlamDepthSource\": \"" << depthSourceState.activeSlamSource << "\",\n";
+    out << "  \"activeMapDepthSource\": \"" << depthSourceState.activeMapSource << "\",\n";
+    out << "  \"depthSourceStatus\": \"" << JsonEscape(depthSourceState.status) << "\",\n";
+    out << "  \"enableRgbPreview\": " << (navigationSettings.enableRgbPreview ? "true" : "false") << ",\n";
+    out << "  \"enableDepthPreview\": " << (navigationSettings.enableDepthPreview ? "true" : "false") << ",\n";
+    out << "  \"enableDepthComparison\": " << (navigationSettings.enableDepthComparison ? "true" : "false") << ",\n";
+    out << "  \"enableDepthDiffPreview\": " << (navigationSettings.enableDepthDiffPreview ? "true" : "false") << ",\n";
     out << "  \"orbDistanceMeters\": " << fixed << setprecision(3) << diagnostics.orbDistanceMeters << ",\n";
     out << "  \"phoneDistanceMeters\": " << fixed << setprecision(3) << diagnostics.phoneDistanceMeters << ",\n";
     out << "  \"scaleRatio\": " << fixed << setprecision(4)
@@ -837,6 +1141,20 @@ void WriteBackendState(const string& path,
     out << "  \"mapDataPath\": \"" << BuildLatestMapDataPath() << "\",\n";
     out << "  \"guidancePath\": \"/tmp/iphone_rgbd_nav_guidance.json\"\n";
     out << "}\n";
+}
+
+chrono::milliseconds EffectiveLatestArtifactsInterval(bool appMode, const NavigationSettings& navigationSettings) {
+    if(!appMode)
+        return kDefaultLatestArtifactsInterval;
+
+    const bool anyPreviewEnabled = navigationSettings.enableRgbPreview ||
+                                   navigationSettings.enableDepthPreview ||
+                                   navigationSettings.enableDepthComparison;
+    return anyPreviewEnabled ? kAppLatestArtifactsInterval : chrono::milliseconds(450);
+}
+
+chrono::milliseconds EffectiveMapDataInterval(bool appMode) {
+    return appMode ? kAppMapDataInterval : kDefaultMapDataInterval;
 }
 
 void ExitLoopHandler(int) {
@@ -1175,7 +1493,6 @@ DepthComparisonDiagnostics CompareDepthMaps(const cv::Mat& sensorDepthMm,
 
     cv::Mat sensorDepthMeters;
     sensorDepthMm.convertTo(sensorDepthMeters, CV_32F, 0.001);
-
     cv::Mat modelDepth = modelDepth32f.clone();
     cv::patchNaNs(modelDepth, 0.0f);
 
@@ -1268,8 +1585,8 @@ DepthComparisonDiagnostics CompareDepthMaps(const cv::Mat& sensorDepthMm,
         const float* sensorPtr = sensorDepthMeters.ptr<float>(y);
         const float* modelPtr = modelDepth.ptr<float>(y);
         float* alignedPtr = alignedModelDepthMeters.ptr<float>(y);
-        float* errorPtr = absErrorMeters.ptr<float>(y);
         const uchar* maskPtr = validMask.ptr<uchar>(y);
+        float* errorPtr = absErrorMeters.ptr<float>(y);
         for(int x = 0; x < sensorDepthMeters.cols; ++x) {
             if(maskPtr[x] == 0)
                 continue;
@@ -1295,6 +1612,21 @@ DepthComparisonDiagnostics CompareDepthMaps(const cv::Mat& sensorDepthMm,
     diagnostics.biasMeters = static_cast<float>(biasSum / validCount);
     diagnostics.hasComparison = true;
     return diagnostics;
+}
+
+cv::Mat DepthMetersToMillimeters(const cv::Mat& depthMeters) {
+    cv::Mat depthMillimeters(depthMeters.size(), CV_16UC1, cv::Scalar(0));
+    for(int y = 0; y < depthMeters.rows; ++y) {
+        const float* source = depthMeters.ptr<float>(y);
+        uint16_t* target = depthMillimeters.ptr<uint16_t>(y);
+        for(int x = 0; x < depthMeters.cols; ++x) {
+            const float value = source[x];
+            if(!std::isfinite(value) || value < kMinDepthMeters || value > kMaxDepthMeters)
+                continue;
+            target[x] = static_cast<uint16_t>(std::round(value * 1000.0f));
+        }
+    }
+    return depthMillimeters;
 }
 
 cv::Size MeasureOverlayText(const string& text, int fontHeight, int thickness, int* baseline = nullptr) {
@@ -2368,18 +2700,29 @@ void WriteWorldPointJsonArray(ostream& out, const string& key, const vector<cv::
     out << "\n";
 }
 
-void WriteMapRenderData(const string& path,
-                        const OccupancyGrid2D& grid,
-                        const OccupancyViewState& viewState,
-                        const LiveStatus& status,
-                        const PlannerState& planner,
-                        const TrajectoryState& trajectory,
-                        const NavigationSettings& settings) {
-    static auto lastWriteTime = chrono::steady_clock::now() - chrono::seconds(10);
-    const auto now = chrono::steady_clock::now();
-    if(now - lastWriteTime < chrono::milliseconds(250))
-        return;
-    lastWriteTime = now;
+MapRenderPayload BuildMapRenderPayload(const string& path,
+                                       const OccupancyGrid2D& grid,
+                                       const OccupancyViewState& viewState,
+                                       const LiveStatus& status,
+                                       const PlannerState& planner,
+                                       const TrajectoryState& trajectory,
+                                       const NavigationSettings& settings) {
+    MapRenderPayload payload;
+    payload.path = path;
+    payload.resolution = grid.resolution();
+    payload.metersPerPixel = viewState.metersPerPixel;
+    payload.viewCenterX = viewState.centerX;
+    payload.viewCenterZ = viewState.centerZ;
+    payload.showInflation = settings.showInflation;
+    payload.inflationRadiusCells = settings.inflationRadiusCells;
+    payload.hasPose = status.hasPose;
+    if(status.hasPose) {
+        payload.robotPosition = status.currentTwc.translation();
+        payload.robotForward = status.currentTwc.rotationMatrix() * Eigen::Vector3f(0.0f, 0.0f, 1.0f);
+    }
+    payload.hasGoal = planner.hasGoal;
+    if(planner.hasGoal)
+        payload.goalWorld = grid.CellCenterWorld(planner.goalCell);
 
     vector<GridKey> freeCells;
     vector<GridKey> occupiedCells;
@@ -2417,43 +2760,12 @@ void WriteMapRenderData(const string& path,
     pathPoints.reserve(planner.pathCells.size());
     for(const GridKey& cell : planner.pathCells)
         pathPoints.push_back(grid.CellCenterWorld(cell));
-
-    ofstream out(path);
-    if(!out.good())
-        return;
-
-    out << "{\n";
-    out << "  \"timestamp\": \"" << JsonEscape(CurrentTimeString()) << "\",\n";
-    out << "  \"resolution\": " << fixed << setprecision(4) << grid.resolution() << ",\n";
-    out << "  \"metersPerPixel\": " << fixed << setprecision(6) << viewState.metersPerPixel << ",\n";
-    out << "  \"viewCenterX\": " << fixed << setprecision(4) << viewState.centerX << ",\n";
-    out << "  \"viewCenterZ\": " << fixed << setprecision(4) << viewState.centerZ << ",\n";
-    out << "  \"showInflation\": " << (settings.showInflation ? "true" : "false") << ",\n";
-    out << "  \"inflationRadiusCells\": " << settings.inflationRadiusCells << ",\n";
-    out << "  \"hasPose\": " << (status.hasPose ? "true" : "false") << ",\n";
-    if(status.hasPose) {
-        const Eigen::Vector3f position = status.currentTwc.translation();
-        const Eigen::Vector3f forward = status.currentTwc.rotationMatrix() * Eigen::Vector3f(0.0f, 0.0f, 1.0f);
-        out << "  \"robot\": {\"x\": " << fixed << setprecision(4) << position.x()
-            << ", \"z\": " << fixed << setprecision(4) << position.z()
-            << ", \"fx\": " << fixed << setprecision(4) << forward.x()
-            << ", \"fz\": " << fixed << setprecision(4) << forward.z() << "},\n";
-    } else {
-        out << "  \"robot\": null,\n";
-    }
-    if(planner.hasGoal) {
-        const cv::Point2f goalWorld = grid.CellCenterWorld(planner.goalCell);
-        out << "  \"goal\": {\"x\": " << fixed << setprecision(4) << goalWorld.x
-            << ", \"z\": " << fixed << setprecision(4) << goalWorld.y << "},\n";
-    } else {
-        out << "  \"goal\": null,\n";
-    }
-    WriteCellJsonArray(out, "freeCells", freeCells, true);
-    WriteCellJsonArray(out, "occupiedCells", occupiedCells, true);
-    WriteCellJsonArray(out, "inflatedCells", inflatedCells, true);
-    WriteWorldPointJsonArray(out, "trajectory", trajectory.samples, true);
-    WriteWorldPointJsonArray(out, "path", pathPoints, false);
-    out << "}\n";
+    payload.freeCells = std::move(freeCells);
+    payload.occupiedCells = std::move(occupiedCells);
+    payload.inflatedCells = std::move(inflatedCells);
+    payload.trajectorySamples = trajectory.samples;
+    payload.pathPoints = std::move(pathPoints);
+    return payload;
 }
 
 void SaveSnapshot(const cv::Mat& image) {
@@ -2465,25 +2777,46 @@ void SaveSnapshot(const cv::Mat& image) {
     cout << "Updated latest navigation snapshot at " << latestSnapshotPath << endl;
 }
 
-void UpdateLatestArtifacts(const cv::Mat& image,
+void UpdateLatestArtifacts(AsyncRenderWriter& writer,
+                          const cv::Mat& image,
                           const cv::Mat& rgbPanel,
                           const cv::Mat& depthPanel,
                           const cv::Mat& mapPanel,
                           const cv::Mat& modelDepthPanel,
-                          const cv::Mat& depthDiffPanel) {
+                          const cv::Mat& depthDiffPanel,
+                          const NavigationSettings& navigationSettings,
+                          chrono::steady_clock::duration minInterval) {
     static auto lastWriteTime = chrono::steady_clock::now() - chrono::seconds(10);
     const auto now = chrono::steady_clock::now();
-    if(now - lastWriteTime < chrono::seconds(2))
+    if(now - lastWriteTime < minInterval)
         return;
     lastWriteTime = now;
-    cv::imwrite(BuildLatestSnapshotPath(), image);
-    cv::imwrite(BuildLatestRgbPath(), rgbPanel);
-    cv::imwrite(BuildLatestDepthPath(), depthPanel);
-    cv::imwrite(BuildLatestMapPath(), mapPanel);
-    if(!modelDepthPanel.empty())
-        cv::imwrite(BuildLatestModelDepthPath(), modelDepthPanel);
-    if(!depthDiffPanel.empty())
-        cv::imwrite(BuildLatestDepthDiffPath(), depthDiffPanel);
+    writer.SubmitLatestArtifacts(LatestArtifactsPayload{
+        image.clone(),
+        rgbPanel.clone(),
+        depthPanel.clone(),
+        mapPanel.clone(),
+        modelDepthPanel.clone(),
+        depthDiffPanel.clone(),
+        navigationSettings
+    });
+}
+
+void QueueMapRenderData(AsyncRenderWriter& writer,
+                        const string& path,
+                        const OccupancyGrid2D& grid,
+                        const OccupancyViewState& viewState,
+                        const LiveStatus& status,
+                        const PlannerState& planner,
+                        const TrajectoryState& trajectory,
+                        const NavigationSettings& settings,
+                        chrono::steady_clock::duration minInterval) {
+    static auto lastWriteTime = chrono::steady_clock::now() - chrono::seconds(10);
+    const auto now = chrono::steady_clock::now();
+    if(now - lastWriteTime < minInterval)
+        return;
+    lastWriteTime = now;
+    writer.SubmitMapRender(BuildMapRenderPayload(path, grid, viewState, status, planner, trajectory, settings));
 }
 
 }  // namespace
@@ -2504,7 +2837,6 @@ int main(int argc, char** argv) {
 #ifdef __APPLE__
     const string depthModelPath = GetEnvOrDefault("ORB_NAV_DEPTH_MODEL_PATH", "models/DepthAnythingV2SmallF16.mlpackage");
 #endif
-
     struct sigaction sigIntHandler {};
     sigIntHandler.sa_handler = ExitLoopHandler;
     sigemptyset(&sigIntHandler.sa_mask);
@@ -2532,15 +2864,19 @@ int main(int argc, char** argv) {
     GuidanceState guidanceState;
     ScaleDiagnostics scaleDiagnostics;
     DepthComparisonDiagnostics depthComparison;
+    DepthSourceState depthSourceState;
     MouseContext mouseContext{&viewState, &planner, grid.resolution()};
     int lastControlRevision = -1;
+    AsyncRenderWriter renderWriter;
 
 #ifdef __APPLE__
     std::unique_ptr<CoreMLDepthEstimator> depthEstimator;
-    depthComparison.modelEnabled = true;
+    depthComparison.modelEnabled = navigationSettings.enableDepthComparison;
     depthEstimator = std::make_unique<CoreMLDepthEstimator>(depthModelPath);
     depthComparison.modelReady = depthEstimator->IsReady();
-    depthComparison.status = depthComparison.modelReady ? "READY" : "MODEL_UNAVAILABLE";
+    depthComparison.status = navigationSettings.enableDepthComparison
+        ? (depthComparison.modelReady ? "READY" : "MODEL_UNAVAILABLE")
+        : "DISABLED";
     if(!depthComparison.modelReady)
         cerr << "Depth comparison model unavailable: " << depthEstimator->Error() << endl;
 #endif
@@ -2559,6 +2895,13 @@ int main(int argc, char** argv) {
     bool localizationOnly = false;
 
     while(gKeepRunning) {
+        depthSourceState.requestedMode = DepthSourceModeKey(navigationSettings.depthSourceMode);
+        if(lastRgbPanel.empty() && lastDepthPanel.empty()) {
+            depthSourceState.activeSlamSource = "sensor";
+            depthSourceState.activeMapSource = "sensor";
+            depthSourceState.status = DepthSourceModeLabel(navigationSettings.depthSourceMode);
+        }
+
         cv::Mat waitingRgb = lastRgbPanel.empty() ? cv::Mat(860, 320, CV_8UC3, cv::Scalar(18, 18, 18)) : lastRgbPanel;
         cv::Mat waitingDepth = lastDepthPanel.empty() ? cv::Mat(860, 320, CV_8UC3, cv::Scalar(20, 20, 20)) : lastDepthPanel;
         cv::Mat waitingModelDepthExport = lastModelDepthPanel.empty() ? BuildAppPreviewPlaceholder(cv::Size(640, 480), "Small V2 深度", "模型深度会在这里更新")
@@ -2597,16 +2940,33 @@ int main(int argc, char** argv) {
             DrawOverlayText(waitingComposite, "截图时间 " + CurrentTimeString(),
                             cv::Point(std::max(18, waitingComposite.cols / 2 - 120), 12), cv::Scalar(235, 235, 235), 18, 1);
         }
-        UpdateLatestArtifacts(waitingComposite, waitingRgbExport, waitingDepthExport, waitingMap, waitingModelDepthExport, waitingDepthDiffExport);
-        WriteMapRenderData(BuildLatestMapDataPath(), grid, viewState, liveStatus, planner, trajectory, navigationSettings);
-        WriteBackendState(statePath, liveStatus, planner, guidanceState, navigationSettings, scaleDiagnostics, depthComparison,
-                          viewState, viewState.panelRect, waitingComposite.size(), false);
+        const auto latestArtifactsInterval = EffectiveLatestArtifactsInterval(appMode, navigationSettings);
+        const auto mapDataInterval = EffectiveMapDataInterval(appMode);
+        UpdateLatestArtifacts(renderWriter, waitingComposite, waitingRgbExport, waitingDepthExport, waitingMap,
+                              waitingModelDepthExport, waitingDepthDiffExport, navigationSettings, latestArtifactsInterval);
+        QueueMapRenderData(renderWriter, BuildLatestMapDataPath(), grid, viewState, liveStatus, planner, trajectory, navigationSettings,
+                           mapDataInterval);
+        WriteBackendState(statePath, liveStatus, planner, guidanceState, navigationSettings, depthSourceState, scaleDiagnostics, depthComparison,
+                          lastControlRevision, viewState, viewState.panelRect, waitingComposite.size(), false);
 
         bool requestSnapshot = false;
         bool requestQuit = false;
+        bool requestExperimentReset = false;
+        bool requestSlamRestart = false;
         BackendControl control;
         if(ReadBackendControl(controlPath, control))
-            ApplyBackendControl(control, lastControlRevision, viewState, planner, navigationSettings, grid, localizationOnly, slam.get(), requestSnapshot, requestQuit);
+            ApplyBackendControl(control, lastControlRevision, viewState, planner, navigationSettings, grid, localizationOnly, slam.get(),
+                                requestExperimentReset, requestSlamRestart, requestSnapshot, requestQuit);
+        if(requestExperimentReset) {
+            ResetNavigationExperimentState(grid, planner, trajectory, floorEstimator, navFrameEstimator,
+                                           scaleDiagnostics, guidanceState, depthComparison, liveStatus,
+                                           viewState, localizationOnly);
+            if(requestSlamRestart && slam) {
+                slam->Shutdown();
+                slam.reset();
+                imageScale = 1.0f;
+            }
+        }
         if(requestSnapshot)
             SaveSnapshot(waitingComposite);
         if(requestQuit)
@@ -2701,58 +3061,127 @@ int main(int argc, char** argv) {
 
         while(gKeepRunning) {
             cv::Mat slamRgb = currentFrame.rgb;
-            cv::Mat slamDepth = ResizeDepthToRgb(currentFrame, currentFrame.rgb.size());
-            if(imageScale != 1.0f) {
-                const int scaledWidth = static_cast<int>(std::round(slamRgb.cols * imageScale));
-                const int scaledHeight = static_cast<int>(std::round(slamRgb.rows * imageScale));
-                cv::resize(slamRgb, slamRgb, cv::Size(scaledWidth, scaledHeight), 0.0, 0.0, cv::INTER_LINEAR);
-                cv::resize(slamDepth, slamDepth, cv::Size(scaledWidth, scaledHeight), 0.0, 0.0, cv::INTER_NEAREST);
-            }
+            cv::Mat sensorDepthRgb = ResizeDepthToRgb(currentFrame, currentFrame.rgb.size());
+            cv::Mat slamDepth = sensorDepthRgb.clone();
+            cv::Mat mapDepth = sensorDepthRgb.clone();
+
+            depthSourceState.requestedMode = DepthSourceModeKey(navigationSettings.depthSourceMode);
+            depthSourceState.activeSlamSource = "sensor";
+            depthSourceState.activeMapSource = "sensor";
+            depthSourceState.status = DepthSourceModeLabel(navigationSettings.depthSourceMode);
 
             cv::Mat modelDepthPreview;
             cv::Mat depthDiffPreview;
             cv::Mat alignedModelDepthMeters;
             cv::Mat depthErrorMeters;
             cv::Mat depthCompareMask;
+            cv::Mat modelDepthRgb;
 #ifdef __APPLE__
             {
-                DepthComparisonDiagnostics frameDepthComparison;
-                frameDepthComparison.modelEnabled = true;
+                DepthComparisonDiagnostics frameDepthComparison = depthComparison;
+                frameDepthComparison.modelEnabled = navigationSettings.enableDepthComparison;
                 frameDepthComparison.modelReady = depthEstimator && depthEstimator->IsReady();
-                frameDepthComparison.status = frameDepthComparison.modelReady ? "READY" : "MODEL_UNAVAILABLE";
+                frameDepthComparison.status = navigationSettings.enableDepthComparison
+                    ? (frameDepthComparison.modelReady ? "READY" : "MODEL_UNAVAILABLE")
+                    : "DISABLED";
 
-                if(frameDepthComparison.modelReady) {
+                const bool needModelForPipeline = navigationSettings.depthSourceMode != DepthSourceMode::Sensor;
+                const bool needModelForDiagnostics = navigationSettings.enableDepthComparison;
+                const bool shouldEvaluateModel = needModelForPipeline ||
+                                                (needModelForDiagnostics &&
+                                                 (frameIndex == 0 || (frameIndex % kSensorModeModelEvalStride) == 0));
+
+                if(frameDepthComparison.modelReady && shouldEvaluateModel) {
                     cv::Mat modelDepth32f;
                     double inferenceMs = 0.0;
                     if(depthEstimator->Infer(currentFrame.rgb, modelDepth32f, inferenceMs)) {
                         cv::Mat modelDepthAtSensor;
                         cv::resize(modelDepth32f, modelDepthAtSensor, currentFrame.depthMm.size(), 0.0, 0.0, cv::INTER_LINEAR);
-                        modelDepthPreview = RotateForPreview(ColorizeDepthFloat(modelDepthAtSensor), currentFrame.header.displayOrientation);
+                        if(navigationSettings.enableDepthComparison)
+                            modelDepthPreview = RotateForPreview(ColorizeDepthFloat(modelDepthAtSensor), currentFrame.header.displayOrientation);
 
                         frameDepthComparison = CompareDepthMaps(currentFrame.depthMm, modelDepthAtSensor,
                                                                 alignedModelDepthMeters, depthErrorMeters, depthCompareMask);
-                        frameDepthComparison.modelEnabled = true;
+                        frameDepthComparison.modelEnabled = navigationSettings.enableDepthComparison;
                         frameDepthComparison.modelReady = true;
                         frameDepthComparison.inferenceMs = static_cast<float>(inferenceMs);
-                        frameDepthComparison.status = frameDepthComparison.hasComparison ? "READY" : "INSUFFICIENT_OVERLAP";
+                        frameDepthComparison.status = navigationSettings.enableDepthComparison
+                            ? (frameDepthComparison.hasComparison ? "READY" : "INSUFFICIENT_OVERLAP")
+                            : "DISABLED";
 
                         if(frameDepthComparison.hasComparison) {
-                            modelDepthPreview = RotateForPreview(
-                                ColorizeDepthFloat(alignedModelDepthMeters, depthCompareMask),
-                                currentFrame.header.displayOrientation);
-                            depthDiffPreview = RotateForPreview(
-                                ColorizeDepthError(depthErrorMeters, depthCompareMask),
-                                currentFrame.header.displayOrientation);
+                            const cv::Mat modelDepthMmSensor = DepthMetersToMillimeters(alignedModelDepthMeters);
+                            cv::resize(modelDepthMmSensor, modelDepthRgb, currentFrame.rgb.size(), 0.0, 0.0, cv::INTER_NEAREST);
+                            if(navigationSettings.enableDepthComparison) {
+                                modelDepthPreview = RotateForPreview(
+                                    ColorizeDepthFloat(alignedModelDepthMeters, depthCompareMask),
+                                    currentFrame.header.displayOrientation);
+                            }
+                            if(navigationSettings.enableDepthComparison && navigationSettings.enableDepthDiffPreview) {
+                                depthDiffPreview = RotateForPreview(
+                                    ColorizeDepthError(depthErrorMeters, depthCompareMask),
+                                    currentFrame.header.displayOrientation);
+                            }
                         }
                     } else {
-                        frameDepthComparison.status = "INFERENCE_FAILED";
+                        frameDepthComparison.status = navigationSettings.enableDepthComparison ? "INFERENCE_FAILED" : "DISABLED";
                     }
+                } else if(frameDepthComparison.modelReady && !needModelForPipeline && navigationSettings.enableDepthComparison) {
+                    frameDepthComparison.status = frameDepthComparison.hasComparison ? "THROTTLED" : "READY";
                 }
                 depthComparison = frameDepthComparison;
             }
 #else
             depthComparison = DepthComparisonDiagnostics{};
 #endif
+
+            const bool modelDepthUsable = depthComparison.hasComparison && !modelDepthRgb.empty();
+            bool skipSlamUpdate = false;
+            bool skipMapIntegration = false;
+            switch(navigationSettings.depthSourceMode) {
+                case DepthSourceMode::Sensor:
+                    depthSourceState.status = "SLAM 与地图都使用 iPhone 传感器深度";
+                    break;
+                case DepthSourceMode::ModelMap:
+                    if(modelDepthUsable) {
+                        mapDepth = modelDepthRgb;
+                        depthSourceState.activeMapSource = "model";
+                        depthSourceState.status = "SLAM 使用传感器深度，地图使用经传感器对齐的模型深度";
+                    } else {
+                        mapDepth.release();
+                        depthSourceState.activeMapSource = "none";
+                        depthSourceState.status = "模型深度暂不可用，本帧未更新地图";
+                        skipMapIntegration = true;
+                    }
+                    break;
+                case DepthSourceMode::ModelFull:
+                    if(modelDepthUsable) {
+                        slamDepth = modelDepthRgb;
+                        mapDepth = modelDepthRgb;
+                        depthSourceState.activeSlamSource = "model";
+                        depthSourceState.activeMapSource = "model";
+                        depthSourceState.status = "SLAM 与地图都使用经传感器对齐的模型深度";
+                    } else {
+                        slamDepth.release();
+                        mapDepth.release();
+                        depthSourceState.activeSlamSource = "none";
+                        depthSourceState.activeMapSource = "none";
+                        depthSourceState.status = "模型深度暂不可用，本帧未更新 SLAM/地图";
+                        skipSlamUpdate = true;
+                        skipMapIntegration = true;
+                    }
+                    break;
+            }
+
+            if(imageScale != 1.0f) {
+                const int scaledWidth = static_cast<int>(std::round(slamRgb.cols * imageScale));
+                const int scaledHeight = static_cast<int>(std::round(slamRgb.rows * imageScale));
+                cv::resize(slamRgb, slamRgb, cv::Size(scaledWidth, scaledHeight), 0.0, 0.0, cv::INTER_LINEAR);
+                if(!slamDepth.empty())
+                    cv::resize(slamDepth, slamDepth, cv::Size(scaledWidth, scaledHeight), 0.0, 0.0, cv::INTER_NEAREST);
+                if(!mapDepth.empty())
+                    cv::resize(mapDepth, mapDepth, cv::Size(scaledWidth, scaledHeight), 0.0, 0.0, cv::INTER_NEAREST);
+            }
 
             const float scaleX = static_cast<float>(slamRgb.cols) / static_cast<float>(currentFrame.header.rgbWidth);
             const float scaleY = static_cast<float>(slamRgb.rows) / static_cast<float>(currentFrame.header.rgbHeight);
@@ -2761,30 +3190,41 @@ int main(int argc, char** argv) {
             const float cx = (currentFrame.header.cx * static_cast<float>(currentFrame.header.rgbWidth) / static_cast<float>(currentFrame.header.depthWidth)) * scaleX;
             const float cy = (currentFrame.header.cy * static_cast<float>(currentFrame.header.rgbHeight) / static_cast<float>(currentFrame.header.depthHeight)) * scaleY;
 
-            const Sophus::SE3f Tcw = slam->TrackRGBD(slamRgb, slamDepth, currentFrame.header.timestamp);
-            const int trackingState = slam->GetTrackingState();
-            liveStatus.trackingState = TrackingStateToString(trackingState);
-            liveStatus.localizationOnly = localizationOnly;
-            liveStatus.hasPose = (trackingState == ORB_SLAM3::Tracking::OK || trackingState == ORB_SLAM3::Tracking::OK_KLT);
-            if(liveStatus.hasPose) {
-                const Sophus::SE3f orbTwc = Tcw.inverse();
-                UpdateScaleDiagnostics(scaleDiagnostics, orbTwc, currentFrame.header);
-                navFrameEstimator.Observe(orbTwc, currentFrame.header);
-                liveStatus.currentTwc = navFrameEstimator.TransformPose(orbTwc);
+            bool poseUpdatedThisFrame = false;
+            Sophus::SE3f orbTwc;
+            if(!skipSlamUpdate) {
+                const Sophus::SE3f Tcw = slam->TrackRGBD(slamRgb, slamDepth, currentFrame.header.timestamp);
+                const int trackingState = slam->GetTrackingState();
+                liveStatus.trackingState = TrackingStateToString(trackingState);
+                liveStatus.localizationOnly = localizationOnly;
+                liveStatus.hasPose = (trackingState == ORB_SLAM3::Tracking::OK || trackingState == ORB_SLAM3::Tracking::OK_KLT);
+                if(liveStatus.hasPose) {
+                    orbTwc = Tcw.inverse();
+                    UpdateScaleDiagnostics(scaleDiagnostics, orbTwc, currentFrame.header);
+                    navFrameEstimator.Observe(orbTwc, currentFrame.header);
+                    liveStatus.currentTwc = navFrameEstimator.TransformPose(orbTwc);
+                    poseUpdatedThisFrame = true;
+                }
             }
 
-            if(liveStatus.hasPose) {
-                vector<float> ySamples;
-                const Sophus::SE3f orbTwc = Tcw.inverse();
-                const vector<Eigen::Vector3f> orbWorldPoints = SampleWorldPoints(slamDepth, orbTwc, fx, fy, cx, cy, ySamples);
-                const vector<Eigen::Vector3f> navWorldPoints = navFrameEstimator.TransformPoints(orbWorldPoints);
+            if(poseUpdatedThisFrame && !skipMapIntegration) {
+                const cv::Mat& floorDepth = (navigationSettings.depthSourceMode == DepthSourceMode::ModelMap) ? slamDepth : mapDepth;
+                vector<float> floorYSamples;
+                const vector<Eigen::Vector3f> floorPointsOrb = SampleWorldPoints(floorDepth, orbTwc, fx, fy, cx, cy, floorYSamples);
+                const vector<Eigen::Vector3f> floorPointsNav = navFrameEstimator.TransformPoints(floorPointsOrb);
                 vector<float> navYSamples;
-                navYSamples.reserve(navWorldPoints.size());
-                for(const Eigen::Vector3f& point : navWorldPoints)
+                navYSamples.reserve(floorPointsNav.size());
+                for(const Eigen::Vector3f& point : floorPointsNav)
                     navYSamples.push_back(point.y());
                 floorEstimator.ObserveFrame(navYSamples, liveStatus.currentTwc.translation().y(), navigationSettings);
                 liveStatus.floorY = floorEstimator.FloorY(liveStatus.currentTwc.translation().y());
+
+                vector<float> mapYSamples;
+                const vector<Eigen::Vector3f> orbWorldPoints = SampleWorldPoints(mapDepth, orbTwc, fx, fy, cx, cy, mapYSamples);
+                const vector<Eigen::Vector3f> navWorldPoints = navFrameEstimator.TransformPoints(orbWorldPoints);
                 grid.IntegratePoints(liveStatus.currentTwc.translation(), navWorldPoints, liveStatus.floorY);
+            }
+            if(poseUpdatedThisFrame) {
                 AppendTrajectorySample(trajectory, liveStatus);
             }
 
@@ -2807,7 +3247,11 @@ int main(int argc, char** argv) {
                 }
             }
 
-            cv::Mat depthPreview = RotateForPreview(ColorizeDepthMm(slamDepth), currentFrame.header.displayOrientation);
+            cv::Mat depthPreview;
+            if(!mapDepth.empty())
+                depthPreview = RotateForPreview(ColorizeDepthMm(mapDepth), currentFrame.header.displayOrientation);
+            else
+                depthPreview = BuildAppPreviewPlaceholder(cv::Size(640, 480), "深度预览", "当前模式下本帧没有可用构图深度");
             cv::Mat depthPanel = depthPreview.clone();
             if(appMode) {
                 DrawCompactBadge(depthPanel, "深度预览", cv::Point(18, 18));
@@ -2844,16 +3288,35 @@ int main(int argc, char** argv) {
                 DrawOverlayText(composite, "截图时间 " + CurrentTimeString(),
                                 cv::Point(std::max(18, composite.cols / 2 - 120), 12), cv::Scalar(235, 235, 235), 18, 1);
             }
-            UpdateLatestArtifacts(composite, rgbPreview, depthPreview, mapPanel, modelDepthPreview, depthDiffPreview);
-            WriteMapRenderData(BuildLatestMapDataPath(), grid, viewState, liveStatus, planner, trajectory, navigationSettings);
-            WriteBackendState(statePath, liveStatus, planner, guidanceState, navigationSettings, scaleDiagnostics, depthComparison,
-                              viewState, viewState.panelRect, composite.size(), true);
+            const auto latestArtifactsInterval = EffectiveLatestArtifactsInterval(appMode, navigationSettings);
+            const auto mapDataInterval = EffectiveMapDataInterval(appMode);
+            UpdateLatestArtifacts(renderWriter, composite, rgbPreview, depthPreview, mapPanel,
+                                  modelDepthPreview, depthDiffPreview, navigationSettings, latestArtifactsInterval);
+            QueueMapRenderData(renderWriter, BuildLatestMapDataPath(), grid, viewState, liveStatus, planner, trajectory, navigationSettings,
+                               mapDataInterval);
+            WriteBackendState(statePath, liveStatus, planner, guidanceState, navigationSettings, depthSourceState, scaleDiagnostics, depthComparison,
+                              lastControlRevision, viewState, viewState.panelRect, composite.size(), true);
 
             bool requestSnapshot = false;
             bool requestQuit = false;
+            bool requestExperimentReset = false;
+            bool requestSlamRestart = false;
             BackendControl control;
             if(ReadBackendControl(controlPath, control))
-                ApplyBackendControl(control, lastControlRevision, viewState, planner, navigationSettings, grid, localizationOnly, slam.get(), requestSnapshot, requestQuit);
+                ApplyBackendControl(control, lastControlRevision, viewState, planner, navigationSettings, grid, localizationOnly, slam.get(),
+                                    requestExperimentReset, requestSlamRestart, requestSnapshot, requestQuit);
+            if(requestExperimentReset) {
+                ResetNavigationExperimentState(grid, planner, trajectory, floorEstimator, navFrameEstimator,
+                                               scaleDiagnostics, guidanceState, depthComparison, liveStatus,
+                                               viewState, localizationOnly);
+                if(requestSlamRestart && slam) {
+                    slam->Shutdown();
+                    slam = make_unique<ORB_SLAM3::System>(vocabularyPath, settingsPath, ORB_SLAM3::System::RGBD, false, 0, outputPrefix);
+                    imageScale = slam->GetImageScale();
+                    if(localizationOnly)
+                        slam->ActivateLocalizationMode();
+                }
+            }
             if(requestSnapshot)
                 SaveSnapshot(composite);
             if(requestQuit) {

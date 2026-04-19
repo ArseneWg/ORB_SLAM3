@@ -3,6 +3,58 @@
 ### V1.0, December 22th, 2021
 **Authors:** Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, [José M. M. Montiel](http://webdiis.unizar.es/~josemari/), [Juan D. Tardos](http://webdiis.unizar.es/~jdtardos/).
 
+## Fork Focus (2026)
+
+This repository is currently being used as a **navigation-oriented fork** of ORB-SLAM3.
+The short-term goal is to use an **iPhone as an RGB-D sensor head**, run **ORB-SLAM3 RGB-D**
+on macOS, and visualize the result in a native desktop app called **ORB Nav Desk**.
+The longer-term goal is to keep the SLAM and navigation stack reusable so the iPhone can later
+be replaced by a Raspberry Pi or another embedded RGB-D camera setup.
+
+### Current Goal
+
+- Use **iPhone RGB-D** as the live sensor input.
+- Run **ORB-SLAM3 `TrackRGBD`** as the main pose-estimation and mapping pipeline on Mac.
+- Build a **2D navigation map** on top of the RGB-D observations for future mobile robot use.
+- Provide a native macOS operator console for monitoring, comparison, and guidance output.
+
+### Current Main Pipeline
+
+```text
+iPhone (RGB + Depth + Intrinsics + Pose)
+-> Examples/RGB-D/rgbd_iphone_stream
+-> ORB-SLAM3 TrackRGBD
+-> 2D occupancy navigation map + trajectory + guidance
+-> macOS ORB Nav Desk
+```
+
+### Key Components In This Fork
+
+- iPhone capture app:
+  `iOS/LiDARMapPreview`
+- RGB-D receiver, SLAM bridge, navigation-map builder:
+  `Examples/RGB-D/rgbd_iphone_stream.cc`
+- Native macOS operator console:
+  `macOS/ORBNavDesk`
+- Architecture notes for the current fork:
+  `iPhone_RGBD_Navigation_Architecture.md`
+
+### Current Status
+
+- The **primary path** is:
+  **iPhone sensor depth -> ORB-SLAM3 RGB-D -> 2D navigation map**
+- The **model-depth path** is currently experimental and is used for comparison/testing only.
+- The current system is best described as a **navigation foundation / operator tool**, not a finished mobile robot stack.
+
+### Quick Start For This Fork
+
+1. Build the repository as usual with `build.sh` or CMake.
+2. Run the iPhone app in `iOS/LiDARMapPreview`.
+3. Launch the macOS app in `macOS/ORBNavDesk`.
+4. Start the backend from ORB Nav Desk, then start iPhone streaming.
+
+For the original upstream ORB-SLAM3 dataset examples and ROS workflow, keep reading below.
+
 The [Changelog](https://github.com/UZ-SLAMLab/ORB_SLAM3/blob/master/Changelog.md) describes the features of each version.
 
 ORB-SLAM3 is the first real-time SLAM library able to perform **Visual, Visual-Inertial and Multi-Map SLAM** with **monocular, stereo and RGB-D** cameras, using **pin-hole and fisheye** lens models. In all sensor configurations, ORB-SLAM3 is as robust as the best systems available in the literature, and significantly more accurate. 
