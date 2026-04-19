@@ -58,6 +58,10 @@ namespace {
 constexpr char kMagic[] = {'L', 'D', 'R', '1'};
 constexpr char kWindowName[] = "ORB-SLAM3 iPhone RGB-D Navigation";
 constexpr int kDefaultFps = 10;
+constexpr uint32_t kMaxPacketHeaderBytes = 64 * 1024;
+constexpr int kMaxFrameDimension = 4096;
+constexpr size_t kMaxRgbPayloadBytes = 8 * 1024 * 1024;
+constexpr size_t kMaxDepthPayloadBytes = 16 * 1024 * 1024;
 constexpr float kGridResolutionMeters = 0.05f;
 constexpr float kMinDepthMeters = 0.15f;
 constexpr float kMaxDepthMeters = 4.5f;
@@ -999,6 +1003,8 @@ void ApplyBackendControl(const BackendControl& control,
                          bool& requestSlamRestart,
                          bool& requestSnapshot,
                          bool& requestQuit) {
+    const bool isNewRevision = control.revision != lastRevision;
+
     if(control.viewMode == "follow")
         ResetFollowView(viewState);
     else if(control.viewMode == "overview")
@@ -1039,13 +1045,13 @@ void ApplyBackendControl(const BackendControl& control,
         }
     }
 
-    if(control.setGoal) {
+    if(isNewRevision && control.setGoal) {
         planner.goalCell = grid.ToCell(control.goalWorldX, control.goalWorldZ);
         planner.hasGoal = true;
         planner.dirty = true;
     }
 
-    if(control.revision == lastRevision)
+    if(!isNewRevision)
         return;
     lastRevision = control.revision;
 
@@ -1273,6 +1279,43 @@ PacketHeader ParseHeader(const string& jsonText) {
     return header;
 }
 
+void ValidatePacketHeader(const PacketHeader& header) {
+    if(header.rgbWidth <= 0 || header.rgbHeight <= 0 ||
+       header.rgbWidth > kMaxFrameDimension || header.rgbHeight > kMaxFrameDimension) {
+        throw runtime_error("invalid RGB frame dimensions");
+    }
+    if(header.rgbSize <= 0 || static_cast<size_t>(header.rgbSize) > kMaxRgbPayloadBytes) {
+        throw runtime_error("invalid RGB payload size");
+    }
+    if(header.depthWidth < 0 || header.depthHeight < 0 ||
+       header.depthWidth > kMaxFrameDimension || header.depthHeight > kMaxFrameDimension) {
+        throw runtime_error("invalid depth frame dimensions");
+    }
+    if(header.depthSize < 0 || static_cast<size_t>(header.depthSize) > kMaxDepthPayloadBytes) {
+        throw runtime_error("invalid depth payload size");
+    }
+    if((header.depthWidth == 0) != (header.depthHeight == 0)) {
+        throw runtime_error("incomplete depth frame dimensions");
+    }
+    if(header.depthWidth == 0 || header.depthHeight == 0) {
+        if(header.depthSize != 0) {
+            throw runtime_error("depth payload missing dimensions");
+        }
+    } else {
+        const uint64_t expectedDepthBytes =
+            static_cast<uint64_t>(header.depthWidth) * static_cast<uint64_t>(header.depthHeight) * sizeof(uint16_t);
+        if(expectedDepthBytes != static_cast<uint64_t>(header.depthSize) ||
+           expectedDepthBytes > static_cast<uint64_t>(kMaxDepthPayloadBytes)) {
+            throw runtime_error("depth payload size does not match dimensions");
+        }
+    }
+    if(!std::isfinite(header.fx) || !std::isfinite(header.fy) ||
+       !std::isfinite(header.cx) || !std::isfinite(header.cy) ||
+       header.fx <= 0.0f || header.fy <= 0.0f) {
+        throw runtime_error("invalid camera intrinsics");
+    }
+}
+
 bool ReceiveFrame(int clientFd, StreamFrame& frame) {
     char magic[4] = {};
     if(!ReadExact(clientFd, magic, sizeof(magic)))
@@ -1284,10 +1327,13 @@ bool ReceiveFrame(int clientFd, StreamFrame& frame) {
     if(!ReadExact(clientFd, &headerSizeBE, sizeof(headerSizeBE)))
         return false;
     const uint32_t headerSize = ntohl(headerSizeBE);
+    if(headerSize == 0 || headerSize > kMaxPacketHeaderBytes)
+        throw runtime_error("invalid packet header size");
     string headerJson(headerSize, '\0');
     if(!ReadExact(clientFd, &headerJson[0], headerJson.size()))
         return false;
     frame.header = ParseHeader(headerJson);
+    ValidatePacketHeader(frame.header);
 
     vector<uint8_t> rgbBytes(static_cast<size_t>(frame.header.rgbSize));
     if(!ReadExact(clientFd, rgbBytes.data(), rgbBytes.size()))
@@ -1876,6 +1922,9 @@ bool HasAtlasFile(const string& outputPrefix) {
 }
 
 string WriteAutoSettings(const PacketHeader& header, const string& outputPrefix, int port) {
+    if(header.depthWidth <= 0 || header.depthHeight <= 0)
+        throw runtime_error("first RGB-D frame is missing depth dimensions");
+
     const float scaleX = static_cast<float>(header.rgbWidth) / static_cast<float>(header.depthWidth);
     const float scaleY = static_cast<float>(header.rgbHeight) / static_cast<float>(header.depthHeight);
     const float fx = header.fx * scaleX;
@@ -3359,21 +3408,27 @@ int main(int argc, char** argv) {
             }
 
             StreamFrame nextFrame;
-            try {
-                if(!ReceiveFrame(clientFd, nextFrame)) {
-                    cerr << "iPhone stream disconnected." << endl;
+            while(gKeepRunning) {
+                try {
+                    if(!ReceiveFrame(clientFd, nextFrame)) {
+                        cerr << "iPhone stream disconnected." << endl;
+                        sessionDisconnected = true;
+                        break;
+                    }
+                    if(nextFrame.depthMm.empty()) {
+                        cerr << "Skipping frame without RGB-D depth payload." << endl;
+                        continue;
+                    }
+                    break;
+                } catch(const exception& error) {
+                    cerr << "Stream error: " << error.what() << endl;
                     sessionDisconnected = true;
                     break;
                 }
-                if(nextFrame.depthMm.empty()) {
-                    cerr << "Skipping frame without RGB-D depth payload." << endl;
-                    continue;
-                }
-            } catch(const exception& error) {
-                cerr << "Stream error: " << error.what() << endl;
-                sessionDisconnected = true;
-                break;
             }
+            if(sessionDisconnected || !gKeepRunning)
+                break;
+
             currentFrame = std::move(nextFrame);
             ++frameIndex;
             if(frameIndex % 20 == 0) {

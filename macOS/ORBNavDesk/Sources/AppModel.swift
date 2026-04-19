@@ -13,6 +13,12 @@ private struct LoadedImageData: Sendable {
 
 @MainActor
 final class AppModel: ObservableObject {
+    nonisolated private static let backendScriptRelativePath = "Examples/RGB-D/run_iphone_rgbd_orbslam3.sh"
+    nonisolated private static let workspaceMarkers = [
+        backendScriptRelativePath,
+        "Vocabulary/ORBvoc.txt",
+    ]
+
     @Published var runtimeState: NavigationRuntimeState?
     @Published var latestImage: NSImage?
     @Published var latestRgbImage: NSImage?
@@ -48,7 +54,7 @@ final class AppModel: ObservableObject {
     @Published var lastStateLoadedAt: Date?
     @Published var lastImageLoadedAt: Date?
 
-    let workspaceRoot = URL(fileURLWithPath: "/Users/xy/work/ORB_SLAM3", isDirectory: true)
+    let workspaceRoot: URL
     let controlPath = URL(fileURLWithPath: "/tmp/iphone_rgbd_nav_control.json")
     let statePath = URL(fileURLWithPath: "/tmp/iphone_rgbd_nav_state.json")
 
@@ -67,6 +73,13 @@ final class AppModel: ObservableObject {
     private var mapLoadTask: Task<Void, Never>?
     private var lastSettingsControlRevision = -1
     private let stateFreshnessWindow: TimeInterval = 3.0
+    private let backendAvailabilityCheckInterval: TimeInterval = 1.0
+    private var lastBackendAvailabilityCheckAt = Date.distantPast
+
+    init() {
+        workspaceRoot = Self.resolveWorkspaceRoot()
+            ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    }
 
     var latestSnapshotURL: URL? {
         guard let path = runtimeState?.latestImagePath, !path.isEmpty else { return nil }
@@ -101,6 +114,12 @@ final class AppModel: ObservableObject {
     var mapDataURL: URL? {
         guard let path = runtimeState?.mapDataPath, !path.isEmpty else { return nil }
         return URL(fileURLWithPath: path)
+    }
+
+    private var backendScriptURL: URL? {
+        let candidate = workspaceRoot.appendingPathComponent(Self.backendScriptRelativePath)
+        guard FileManager.default.fileExists(atPath: candidate.path) else { return nil }
+        return candidate
     }
 
     var connectionSummary: String {
@@ -190,6 +209,12 @@ final class AppModel: ObservableObject {
         if backendRunning { return }
         backendIssue = nil
 
+        guard let backendScriptURL else {
+            backendIssue = "未找到工作目录"
+            appendLog("无法启动后端：未找到 ORB_SLAM3 工作目录。请从仓库目录启动 ORB Nav Desk，或设置 ORB_SLAM3_WORKSPACE_ROOT。\n")
+            return
+        }
+
         if isPortInUse(9000) {
             if canAdoptExistingBackend() {
                 backendRunning = true
@@ -207,7 +232,7 @@ final class AppModel: ObservableObject {
 
         let process = Process()
         process.currentDirectoryURL = workspaceRoot
-        process.executableURL = URL(fileURLWithPath: "/Users/xy/work/ORB_SLAM3/Examples/RGB-D/run_iphone_rgbd_orbslam3.sh")
+        process.executableURL = backendScriptURL
         process.arguments = ["9000", "iphone_rgbd_orbslam3"]
 
         var environment = ProcessInfo.processInfo.environment
@@ -343,7 +368,7 @@ final class AppModel: ObservableObject {
     }
 
     func refreshNow() {
-        refreshBackendAvailability()
+        refreshBackendAvailabilityIfNeeded(force: true)
         pollFiles()
     }
 
@@ -465,6 +490,7 @@ final class AppModel: ObservableObject {
     }
 
     private func pollFiles() {
+        refreshBackendAvailabilityIfNeeded()
         loadStateIfNeeded()
         loadImageIfNeeded()
         loadPanelImagesIfNeeded()
@@ -614,6 +640,24 @@ final class AppModel: ObservableObject {
         return Date().timeIntervalSince(modified) <= stateFreshnessWindow
     }
 
+    private func refreshBackendAvailabilityIfNeeded(force: Bool = false) {
+        if process?.isRunning == true {
+            backendRunning = true
+            if backendIssue == "后端启动失败" {
+                backendIssue = nil
+            }
+            return
+        }
+
+        let now = Date()
+        if !force, now.timeIntervalSince(lastBackendAvailabilityCheckAt) < backendAvailabilityCheckInterval {
+            return
+        }
+
+        lastBackendAvailabilityCheckAt = now
+        refreshBackendAvailability()
+    }
+
     private func refreshBackendAvailability(using stateModified: Date? = nil) {
         let ownsRunningProcess = process?.isRunning == true
         let stateLooksFresh: Bool
@@ -659,6 +703,53 @@ final class AppModel: ObservableObject {
     private func trimLogs() {
         if logs.count > 18000 {
             logs = String(logs.suffix(18000))
+        }
+    }
+
+    nonisolated private static func resolveWorkspaceRoot() -> URL? {
+        let fileManager = FileManager.default
+        var candidates: [URL] = []
+
+        if let envPath = ProcessInfo.processInfo.environment["ORB_SLAM3_WORKSPACE_ROOT"],
+           !envPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            candidates.append(URL(fileURLWithPath: envPath, isDirectory: true))
+        }
+
+        candidates.append(URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true))
+        candidates.append(URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent())
+        candidates.append(Bundle.main.bundleURL)
+
+        for candidate in candidates {
+            if let root = findWorkspaceRoot(startingAt: candidate) {
+                return root
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func findWorkspaceRoot(startingAt startURL: URL) -> URL? {
+        var candidate = startURL.standardizedFileURL
+
+        while true {
+            if isWorkspaceRoot(candidate) {
+                return candidate
+            }
+
+            let parent = candidate.deletingLastPathComponent()
+            if parent.path == candidate.path {
+                return nil
+            }
+            candidate = parent
+        }
+    }
+
+    nonisolated private static func isWorkspaceRoot(_ url: URL) -> Bool {
+        let fileManager = FileManager.default
+        return workspaceMarkers.allSatisfy { marker in
+            fileManager.fileExists(atPath: url.appendingPathComponent(marker).path)
         }
     }
 }

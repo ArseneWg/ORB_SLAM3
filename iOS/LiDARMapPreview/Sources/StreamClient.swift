@@ -13,11 +13,14 @@ final class StreamClient: @unchecked Sendable {
     private let stateLock = NSLock()
     private let sendQueue = DispatchQueue(label: "LiDARMapPreview.StreamClient")
     private let ciContext = CIContext()
+    private let reconnectDelay: TimeInterval = 1.0
 
     private var endpoint = Endpoint(host: "", port: 9000)
     private var connection: NWConnection?
+    private var reconnectWorkItem: DispatchWorkItem?
     private var isReady = false
     private var isStreaming = false
+    private var sendInFlight = false
     private var frameIndex: UInt64 = 0
     private var lastSentTimestamp: TimeInterval = 0
     private let targetFPS: Double = 10.0
@@ -36,7 +39,7 @@ final class StreamClient: @unchecked Sendable {
         var shouldReconnect = false
 
         stateLock.lock()
-        if endpoint != newEndpoint || connection == nil {
+        if endpoint != newEndpoint || connection == nil || !isReady {
             endpoint = newEndpoint
             shouldReconnect = true
         }
@@ -54,6 +57,9 @@ final class StreamClient: @unchecked Sendable {
         stateLock.lock()
         isStreaming = false
         isReady = false
+        sendInFlight = false
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
         let currentConnection = connection
         connection = nil
         stateLock.unlock()
@@ -63,38 +69,45 @@ final class StreamClient: @unchecked Sendable {
     }
 
     func process(frame: ARFrame) {
-        let snapshot: (Endpoint, UInt64)?
+        let snapshot: (NWConnection, Endpoint, UInt64)?
 
         stateLock.lock()
-        let active = isStreaming && isReady && connection != nil
+        let currentConnection = connection
+        let active = isStreaming && isReady && currentConnection != nil && !sendInFlight
         let minInterval = 1.0 / targetFPS
         let enoughTimeElapsed = frame.timestamp - lastSentTimestamp >= minInterval
 
-        if active && enoughTimeElapsed {
+        if active && enoughTimeElapsed, let currentConnection {
             lastSentTimestamp = frame.timestamp
             frameIndex += 1
-            snapshot = (endpoint, frameIndex)
+            sendInFlight = true
+            snapshot = (currentConnection, endpoint, frameIndex)
         } else {
             snapshot = nil
         }
         stateLock.unlock()
 
-        guard let (currentEndpoint, currentFrameIndex) = snapshot else {
+        guard let (currentConnection, currentEndpoint, currentFrameIndex) = snapshot else {
             return
         }
 
         guard let payload = makePayload(frame: frame, frameIndex: currentFrameIndex) else {
+            stateLock.lock()
+            sendInFlight = false
+            stateLock.unlock()
             return
         }
 
         sendQueue.async { [weak self] in
             guard let self else { return }
 
-            self.stateLock.lock()
-            let currentConnection = self.connection
-            self.stateLock.unlock()
+            currentConnection.send(content: payload, completion: .contentProcessed { error in
+                self.stateLock.lock()
+                if self.connection === currentConnection {
+                    self.sendInFlight = false
+                }
+                self.stateLock.unlock()
 
-            currentConnection?.send(content: payload, completion: .contentProcessed { error in
                 if let error {
                     self.publishStatus("send failed: \(error.localizedDescription)")
                     self.reconnect()
@@ -134,9 +147,12 @@ private extension StreamClient {
         let currentEndpoint = endpoint
         let shouldStream = isStreaming
 
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
         connection?.cancel()
         connection = nil
         isReady = false
+        sendInFlight = false
         stateLock.unlock()
 
         guard shouldStream else {
@@ -162,31 +178,62 @@ private extension StreamClient {
             switch state {
             case .ready:
                 self.stateLock.lock()
+                guard self.connection === connection else {
+                    self.stateLock.unlock()
+                    return
+                }
                 self.isReady = true
+                self.sendInFlight = false
+                self.reconnectWorkItem?.cancel()
+                self.reconnectWorkItem = nil
                 self.stateLock.unlock()
                 self.publishStatus("connected to \(currentEndpoint.host):\(currentEndpoint.port)")
 
             case .waiting(let error):
+                var shouldReconnect = false
                 self.stateLock.lock()
-                self.isReady = false
+                if self.connection === connection {
+                    self.isReady = false
+                    self.sendInFlight = false
+                    shouldReconnect = self.isStreaming
+                }
                 self.stateLock.unlock()
                 self.publishStatus("waiting: \(error.localizedDescription)")
+                if shouldReconnect {
+                    self.scheduleReconnect()
+                }
 
             case .failed(let error):
+                var shouldReconnect = false
                 self.stateLock.lock()
-                self.isReady = false
-                self.connection = nil
+                if self.connection === connection {
+                    self.isReady = false
+                    self.sendInFlight = false
+                    self.connection = nil
+                    shouldReconnect = self.isStreaming
+                }
                 self.stateLock.unlock()
                 self.publishStatus("failed: \(error.localizedDescription)")
+                if shouldReconnect {
+                    self.scheduleReconnect()
+                }
 
             case .cancelled:
                 self.stateLock.lock()
-                self.isReady = false
-                self.connection = nil
+                if self.connection === connection {
+                    self.isReady = false
+                    self.sendInFlight = false
+                    self.connection = nil
+                }
                 self.stateLock.unlock()
 
             case .setup, .preparing:
-                self.publishStatus("connecting to \(currentEndpoint.host):\(currentEndpoint.port)")
+                self.stateLock.lock()
+                let isCurrentConnection = self.connection === connection
+                self.stateLock.unlock()
+                if isCurrentConnection {
+                    self.publishStatus("connecting to \(currentEndpoint.host):\(currentEndpoint.port)")
+                }
 
             @unknown default:
                 self.publishStatus("unknown connection state")
@@ -198,6 +245,31 @@ private extension StreamClient {
         stateLock.unlock()
 
         connection.start(queue: sendQueue)
+    }
+
+    func scheduleReconnect() {
+        stateLock.lock()
+        guard isStreaming, reconnectWorkItem == nil else {
+            stateLock.unlock()
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+
+            self.stateLock.lock()
+            self.reconnectWorkItem = nil
+            let shouldReconnect = self.isStreaming && !self.isReady
+            self.stateLock.unlock()
+
+            if shouldReconnect {
+                self.reconnect()
+            }
+        }
+        reconnectWorkItem = workItem
+        stateLock.unlock()
+
+        sendQueue.asyncAfter(deadline: .now() + reconnectDelay, execute: workItem)
     }
 
     func publishStatus(_ status: String) {
