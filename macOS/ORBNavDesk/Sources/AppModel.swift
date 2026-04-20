@@ -11,6 +11,11 @@ private struct LoadedImageData: Sendable {
     let data: Data
 }
 
+private struct BackendListenerStatus {
+    var occupied = false
+    var looksLikeOrbBackend = false
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     nonisolated private static let backendScriptRelativePath = "Examples/RGB-D/run_iphone_rgbd_orbslam3.sh"
@@ -57,6 +62,8 @@ final class AppModel: ObservableObject {
     let workspaceRoot: URL
     let controlPath = URL(fileURLWithPath: "/tmp/iphone_rgbd_nav_control.json")
     let statePath = URL(fileURLWithPath: "/tmp/iphone_rgbd_nav_state.json")
+    let backendLogPath = URL(fileURLWithPath: "/tmp/iphone_rgbd_nav_backend.log")
+    let deskLogPath = URL(fileURLWithPath: "/tmp/orb_nav_desk.log")
 
     private var process: Process?
     private var stdoutPipe: Pipe?
@@ -211,21 +218,22 @@ final class AppModel: ObservableObject {
 
         guard let backendScriptURL else {
             backendIssue = "未找到工作目录"
-            appendLog("无法启动后端：未找到 ORB_SLAM3 工作目录。请从仓库目录启动 ORB Nav Desk，或设置 ORB_SLAM3_WORKSPACE_ROOT。\n")
+            appendLocalLog("无法启动后端：未找到 ORB_SLAM3 工作目录。请从仓库目录启动 ORB Nav Desk，或设置 ORB_SLAM3_WORKSPACE_ROOT。")
             return
         }
 
-        if isPortInUse(9000) {
-            if canAdoptExistingBackend() {
+        let listenerStatus = backendListenerStatus(for: 9000)
+        if listenerStatus.occupied {
+            if listenerStatus.looksLikeOrbBackend {
                 backendRunning = true
-                backendIssue = nil
-                appendLog("检测到已有 rgbd_iphone_stream 在运行，已接管现有后端。\n")
+                backendIssue = isStateFresh() ? nil : "等待已有后端就绪"
+                appendLocalLog("检测到已有 rgbd_iphone_stream 在运行，已改为复用现有后端。后端日志：\(backendLogPath.path)")
                 startPolling()
                 refreshNow()
                 return
             }
             backendIssue = "端口 9000 被占用"
-            appendLog("无法启动后端：端口 9000 已被其他 rgbd_iphone_stream 实例占用。请先停止已有后端。\n")
+            appendLocalLog("无法启动后端：端口 9000 已被其他进程占用。请先停止已有进程。")
             refreshNow()
             return
         }
@@ -239,6 +247,7 @@ final class AppModel: ObservableObject {
         environment["ORB_NAV_APP_MODE"] = "1"
         environment["ORB_NAV_CONTROL_PATH"] = controlPath.path
         environment["ORB_NAV_STATE_PATH"] = statePath.path
+        environment["ORB_NAV_LOG_PATH"] = backendLogPath.path
         process.environment = environment
 
         let stdout = Pipe()
@@ -267,9 +276,9 @@ final class AppModel: ObservableObject {
                 self?.cleanupProcessState()
                 if status != 0 {
                     self?.backendIssue = "后端启动失败"
-                    self?.appendLog("Backend exited with status \(status).\n")
+                    self?.appendLocalLog("后端退出，状态码 \(status)。")
                 } else {
-                    self?.appendLog("Backend exited.\n")
+                    self?.appendLocalLog("后端已退出。")
                 }
             }
         }
@@ -281,18 +290,19 @@ final class AppModel: ObservableObject {
             self.stderrPipe = stderr
             self.backendRunning = true
             self.backendIssue = nil
-            appendLog("Started backend in app mode.\n")
+            appendLocalLog("已启动后端，工作目录：\(workspaceRoot.path)；后端日志：\(backendLogPath.path)")
             startPolling()
             sendControl()
             refreshNow()
         } catch {
             backendIssue = "后端启动失败"
-            appendLog("Failed to start backend: \(error.localizedDescription)\n")
+            appendLocalLog("后端启动失败：\(error.localizedDescription)")
         }
     }
 
     func stop() {
         guard backendRunning else { return }
+        appendLocalLog("请求停止后端。")
         sendOneShot { envelope in
             envelope.quit = true
         }
@@ -466,8 +476,9 @@ final class AppModel: ObservableObject {
         do {
             let data = try JSONEncoder().encode(payload)
             try data.write(to: controlPath, options: .atomic)
+            appendLocalLog("已写入控制：\(describeControl(payload))")
         } catch {
-            appendLog("Failed to write control file: \(error.localizedDescription)\n")
+            appendLocalLog("写控制文件失败：\(error.localizedDescription)")
         }
     }
 
@@ -501,17 +512,17 @@ final class AppModel: ObservableObject {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: statePath.path),
               let modified = attributes[.modificationDate] as? Date else { return }
         if let lastStateMTime, modified <= lastStateMTime { return }
-        lastStateMTime = modified
 
         do {
             let data = try Data(contentsOf: statePath)
             let state = try JSONDecoder().decode(NavigationRuntimeState.self, from: data)
+            lastStateMTime = modified
             runtimeState = state
             lastStateLoadedAt = modified
             refreshBackendAvailability(using: modified)
             syncSettingsFromRuntime()
         } catch {
-            appendLog("Failed to decode runtime state: \(error.localizedDescription)\n")
+            appendLocalLog("解码运行时状态失败：\(error.localizedDescription)")
         }
     }
 
@@ -603,7 +614,7 @@ final class AppModel: ObservableObject {
                 }
             } catch {
                 await MainActor.run {
-                    self.appendLog("Failed to decode map data: \(error.localizedDescription)\n")
+                    self.appendLocalLog("解码地图数据失败：\(error.localizedDescription)")
                     self.mapLoadTask = nil
                 }
             }
@@ -627,11 +638,6 @@ final class AppModel: ObservableObject {
         process = nil
         backendRunning = false
         stopPolling()
-    }
-
-    private func canAdoptExistingBackend() -> Bool {
-        guard isPortInUse(9000) else { return false }
-        return isStateFresh()
     }
 
     private func isStateFresh() -> Bool {
@@ -666,9 +672,11 @@ final class AppModel: ObservableObject {
         } else {
             stateLooksFresh = isStateFresh()
         }
-        let externalBackendAvailable = isPortInUse(9000) && stateLooksFresh
+        let listenerStatus = backendListenerStatus(for: 9000)
+        let externalBackendAvailable = listenerStatus.looksLikeOrbBackend && stateLooksFresh
         backendRunning = ownsRunningProcess || externalBackendAvailable
-        if backendRunning, backendIssue == "后端启动失败" {
+        if backendRunning,
+           backendIssue == "后端启动失败" || backendIssue == "等待已有后端就绪" {
             backendIssue = nil
         }
         if backendRunning {
@@ -676,10 +684,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    nonisolated private func isPortInUse(_ port: Int) -> Bool {
+    nonisolated private func backendListenerStatus(for port: Int) -> BackendListenerStatus {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        process.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN"]
+        process.arguments = ["-nP", "-F", "pcn", "-iTCP:\(port)", "-sTCP:LISTEN"]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
@@ -687,12 +695,35 @@ final class AppModel: ObservableObject {
             try process.run()
             process.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard process.terminationStatus == 0 else { return false }
+            guard process.terminationStatus == 0 else { return BackendListenerStatus() }
             let output = String(decoding: data, as: UTF8.self)
-            return output.contains("rgbd_iphone_stream") || output.contains("run_iphone_rgbd_orbslam3.sh")
+            var status = BackendListenerStatus()
+            for line in output.split(whereSeparator: \.isNewline) {
+                guard let prefix = line.first else { continue }
+                switch prefix {
+                case "p":
+                    status.occupied = true
+                case "c":
+                    let command = String(line.dropFirst())
+                    if command.contains("rgbd_iphone_stream") || command.contains("run_iphone_rgbd_orbslam3") {
+                        status.looksLikeOrbBackend = true
+                    }
+                default:
+                    continue
+                }
+            }
+            return status
         } catch {
-            return false
+            return BackendListenerStatus()
         }
+    }
+
+    private func appendLocalLog(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let line = "[\(currentLogTimestamp())] [ORBNavDesk] \(trimmed)\n"
+        appendLog(line)
+        persistDeskLog(line)
     }
 
     private func appendLog(_ text: String) {
@@ -704,6 +735,80 @@ final class AppModel: ObservableObject {
         if logs.count > 18000 {
             logs = String(logs.suffix(18000))
         }
+    }
+
+    private func currentLogTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return formatter.string(from: Date())
+    }
+
+    private func persistDeskLog(_ line: String) {
+        guard let data = line.data(using: .utf8) else { return }
+        let fileManager = FileManager.default
+
+        if !fileManager.fileExists(atPath: deskLogPath.path) {
+            try? data.write(to: deskLogPath, options: .atomic)
+            return
+        }
+
+        guard let handle = try? FileHandle(forWritingTo: deskLogPath) else { return }
+        defer { try? handle.close() }
+        handle.seekToEndOfFile()
+        handle.write(data)
+    }
+
+    private func describeControl(_ payload: ControlEnvelope) -> String {
+        var parts: [String] = ["revision=\(payload.revision)"]
+        if let viewMode = payload.viewMode {
+            parts.append("view=\(viewMode)")
+        }
+        if let mode = payload.depthSourceMode {
+            parts.append("depth_mode=\(mode)")
+        }
+        if let localizationOnly = payload.localizationOnly {
+            parts.append("tracking_mode=\(localizationOnly ? "localization" : "slam")")
+        }
+        if let fixedHeightMode = payload.fixedHeightMode {
+            parts.append("height_mode=\(fixedHeightMode ? "fixed" : "adaptive")")
+        }
+        if let fixedHeight = payload.fixedCameraHeightMeters {
+            parts.append(String(format: "fixed_h=%.2f", fixedHeight))
+        }
+        if let inflation = payload.inflationRadiusCells {
+            parts.append("inflation=\(inflation)")
+        }
+        if let lookahead = payload.lookaheadMeters {
+            parts.append(String(format: "lookahead=%.2f", lookahead))
+        }
+        if payload.enableRgbPreview == true {
+            parts.append("rgb_preview=on")
+        }
+        if payload.enableDepthPreview == true {
+            parts.append("depth_preview=on")
+        }
+        if payload.enableDepthComparison == true {
+            parts.append("depth_compare=on")
+        }
+        if payload.enableDepthDiffPreview == true {
+            parts.append("depth_diff=on")
+        }
+        if payload.clearGoal == true {
+            parts.append("clear_goal")
+        }
+        if payload.saveSnapshot == true {
+            parts.append("save_snapshot")
+        }
+        if payload.quit == true {
+            parts.append("quit")
+        }
+        if payload.setGoal == true,
+           let x = payload.goalWorldX,
+           let z = payload.goalWorldZ {
+            parts.append(String(format: "goal=(%.2f, %.2f)", x, z))
+        }
+        return parts.joined(separator: "  ")
     }
 
     nonisolated private static func resolveWorkspaceRoot() -> URL? {

@@ -17,8 +17,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -58,6 +60,7 @@ namespace {
 constexpr char kMagic[] = {'L', 'D', 'R', '1'};
 constexpr char kWindowName[] = "ORB-SLAM3 iPhone RGB-D Navigation";
 constexpr int kDefaultFps = 10;
+constexpr char kDefaultEventLogPath[] = "/tmp/iphone_rgbd_nav_backend.log";
 constexpr uint32_t kMaxPacketHeaderBytes = 64 * 1024;
 constexpr int kMaxFrameDimension = 4096;
 constexpr size_t kMaxRgbPayloadBytes = 8 * 1024 * 1024;
@@ -76,8 +79,38 @@ constexpr auto kDefaultLatestArtifactsInterval = chrono::seconds(2);
 constexpr auto kAppMapDataInterval = chrono::milliseconds(180);
 constexpr auto kDefaultMapDataInterval = chrono::milliseconds(750);
 constexpr int kSensorModeModelEvalStride = 5;
+constexpr int kPerformanceSummaryFrames = 20;
+constexpr float kScaleRatioWarnMin = 0.75f;
+constexpr float kScaleRatioWarnMax = 1.25f;
+constexpr float kScaleRatioWarnDistanceMeters = 1.0f;
+constexpr double kScaleRatioWindowSeconds = 3.0;
+constexpr float kScaleRatioWindowWarnDistanceMeters = 0.35f;
+constexpr double kScaleRatioMaxFrameGapSeconds = 0.35;
+constexpr float kScaleRatioDiscontinuityMinMeters = 0.05f;
+constexpr float kScaleRatioPairJumpFactor = 4.0f;
+constexpr int kStreamWarmupTrustedFrames = 12;
+constexpr double kStreamWarmupTrustedSeconds = 0.8;
+constexpr double kProcessingSummaryWarnMs = 120.0;
+constexpr double kTrackSummaryWarnMs = 80.0;
+constexpr double kInferenceSummaryWarnMs = 80.0;
+constexpr float kDepthOverlapWarnRatio = 0.20f;
+constexpr float kDepthMaeWarnMeters = 0.35f;
+constexpr size_t kFloorSamplesWarnCount = 48;
+constexpr size_t kMapPointsWarnCount = 96;
 
 atomic<bool> gKeepRunning{true};
+
+enum class LogLevel {
+    Info,
+    Warning,
+    Error
+};
+
+mutex gEventLogMutex;
+string gEventLogPath;
+unique_ptr<ofstream> gEventLogFile;
+
+class OccupancyGrid2D;
 
 struct PacketHeader {
     uint64_t frameIndex = 0;
@@ -93,6 +126,9 @@ struct PacketHeader {
     float fy = 0.0f;
     float cx = 0.0f;
     float cy = 0.0f;
+    string arTrackingState = "unknown";
+    string arTrackingReason;
+    string arWorldMappingStatus = "unknown";
     array<float, 16> pose {};
     bool hasPose = false;
 };
@@ -177,15 +213,55 @@ struct TrajectoryState {
     vector<cv::Point2f> samples;
 };
 
+struct ScaleWindowSample {
+    double timestampSeconds = 0.0;
+    float orbDeltaMeters = 0.0f;
+    float phoneDeltaMeters = 0.0f;
+    Eigen::Vector3f orbStartPosition = Eigen::Vector3f::Zero();
+    Eigen::Vector3f phoneStartPosition = Eigen::Vector3f::Zero();
+    Eigen::Vector3f orbEndPosition = Eigen::Vector3f::Zero();
+    Eigen::Vector3f phoneEndPosition = Eigen::Vector3f::Zero();
+};
+
+struct ScaleWindowStats {
+    float orbDistanceMeters = 0.0f;
+    float phoneDistanceMeters = 0.0f;
+    float ratio = 0.0f;
+    float orbDisplacementMeters = 0.0f;
+    float phoneDisplacementMeters = 0.0f;
+    float displacementRatio = 0.0f;
+    double durationSeconds = 0.0;
+    size_t samples = 0;
+};
+
+struct ScaleUpdateEvent {
+    bool pairAccepted = false;
+    bool windowReset = false;
+    string resetReason;
+    float orbDeltaMeters = 0.0f;
+    float phoneDeltaMeters = 0.0f;
+};
+
 struct ScaleDiagnostics {
     bool hasOrbPose = false;
     bool hasPhonePose = false;
     Eigen::Vector3f previousOrbPosition = Eigen::Vector3f::Zero();
     Eigen::Vector3f previousPhonePosition = Eigen::Vector3f::Zero();
+    bool hasStableAnchor = false;
+    Eigen::Vector3f stableAnchorOrbPosition = Eigen::Vector3f::Zero();
+    Eigen::Vector3f stableAnchorPhonePosition = Eigen::Vector3f::Zero();
     float orbDistanceMeters = 0.0f;
     float phoneDistanceMeters = 0.0f;
+    float stableOrbDisplacementMeters = 0.0f;
+    float stablePhoneDisplacementMeters = 0.0f;
     uint64_t orbSegments = 0;
     uint64_t phoneSegments = 0;
+    deque<ScaleWindowSample> recentSamples;
+    float recentOrbDistanceMeters = 0.0f;
+    float recentPhoneDistanceMeters = 0.0f;
+    bool previousSampleTrusted = false;
+    uint64_t previousPhoneFrameIndex = 0;
+    double previousTimestampSeconds = 0.0;
 };
 
 enum class DepthSourceMode {
@@ -235,6 +311,41 @@ struct DepthComparisonDiagnostics {
     float biasMeters = 0.0f;
 };
 
+struct PerformanceWindow {
+    int frames = 0;
+    int captureGapSamples = 0;
+    int trackSamples = 0;
+    int inferenceSamples = 0;
+    int mapSamples = 0;
+    int renderSamples = 0;
+    int poseFrames = 0;
+    double totalCaptureGapMs = 0.0;
+    double totalProcessingMs = 0.0;
+    double totalTrackMs = 0.0;
+    double totalInferenceMs = 0.0;
+    double totalMapMs = 0.0;
+    double totalRenderMs = 0.0;
+    size_t totalFloorSamples = 0;
+    size_t totalMapPoints = 0;
+    uint64_t startGridVersion = 0;
+    bool hasStartGridVersion = false;
+
+    void Reset(uint64_t gridVersion) {
+        *this = PerformanceWindow{};
+        startGridVersion = gridVersion;
+        hasStartGridVersion = true;
+    }
+};
+
+struct MapQualityStats {
+    size_t knownCells = 0;
+    size_t occupiedCells = 0;
+    size_t freeCells = 0;
+    bool hasBounds = false;
+    float widthMeters = 0.0f;
+    float heightMeters = 0.0f;
+};
+
 struct DepthSourceState {
     string requestedMode = "sensor";
     string activeSlamSource = "sensor";
@@ -276,6 +387,7 @@ struct BackendControl {
 };
 
 string CurrentTimeString();
+string CurrentLogTimestamp();
 string JsonEscape(const string& input);
 string BuildLatestSnapshotPath();
 string BuildLatestRgbPath();
@@ -283,6 +395,32 @@ string BuildLatestDepthPath();
 string BuildLatestMapPath();
 string BuildLatestModelDepthPath();
 string BuildLatestDepthDiffPath();
+void InitializeEventLog(const string& path);
+void LogInfo(const string& message);
+void LogWarning(const string& message);
+void LogError(const string& message);
+double AverageMs(double total, int count);
+bool WriteTextFileAtomically(const string& path, const string& contents);
+MapQualityStats ComputeMapQualityStats(const OccupancyGrid2D& grid);
+float ScaleRatioForDistances(float orbDistanceMeters, float phoneDistanceMeters);
+bool ScaleRatioLooksWrong(float ratio,
+                          float orbDistanceMeters,
+                          float phoneDistanceMeters,
+                          float minDistanceMeters);
+ScaleWindowStats CurrentScaleWindowStats(const ScaleDiagnostics& diagnostics);
+bool IsPhoneReferenceTrusted(const PacketHeader& header);
+bool ResetRecentScaleWindow(ScaleDiagnostics& diagnostics);
+bool InvalidateScaleDiagnostics(ScaleDiagnostics& diagnostics, bool clearRecentWindow);
+string DescribeArkitTrackingState(const PacketHeader& header);
+string DescribeArkitReference(const PacketHeader& header);
+void LogPerformanceSummary(const PerformanceWindow& window,
+                           const OccupancyGrid2D& grid,
+                           const PlannerState& planner,
+                           const TrajectoryState& trajectory,
+                           const ScaleDiagnostics& diagnostics,
+                           const DepthComparisonDiagnostics& depthComparison,
+                           const PacketHeader& latestPhoneHeader,
+                           bool localizationOnly);
 void WriteCellJsonArray(ostream& out, const string& key, const vector<GridKey>& cells, bool trailingComma);
 void WriteWorldPointJsonArray(ostream& out, const string& key, const vector<cv::Point2f>& points, bool trailingComma);
 
@@ -372,9 +510,7 @@ private:
     }
 
     static void WriteMapRenderDataNow(const MapRenderPayload& payload) {
-        ofstream out(payload.path);
-        if(!out.good())
-            return;
+        ostringstream out;
 
         out << "{\n";
         out << "  \"timestamp\": \"" << JsonEscape(CurrentTimeString()) << "\",\n";
@@ -405,6 +541,7 @@ private:
         WriteWorldPointJsonArray(out, "trajectory", payload.trajectorySamples, true);
         WriteWorldPointJsonArray(out, "path", payload.pathPoints, false);
         out << "}\n";
+        WriteTextFileAtomically(payload.path, out.str());
     }
 
     void Run() {
@@ -695,6 +832,27 @@ private:
     unordered_map<GridKey, GridCell, GridKeyHash> mCells;
 };
 
+MapQualityStats ComputeMapQualityStats(const OccupancyGrid2D& grid) {
+    MapQualityStats stats;
+    const auto cells = grid.Cells();
+    stats.knownCells = cells.size();
+    for(const auto& entry : cells) {
+        const float logOdds = entry.second;
+        if(logOdds > 1.2f)
+            ++stats.occupiedCells;
+        else if(logOdds < -0.65f)
+            ++stats.freeCells;
+    }
+
+    const GridBounds bounds = grid.Bounds();
+    if(bounds.valid) {
+        stats.hasBounds = true;
+        stats.widthMeters = static_cast<float>(bounds.maxX - bounds.minX + 1) * grid.resolution();
+        stats.heightMeters = static_cast<float>(bounds.maxZ - bounds.minZ + 1) * grid.resolution();
+    }
+    return stats;
+}
+
 class FloorEstimator {
 public:
     void ObserveFrame(const vector<float>& pointYs,
@@ -816,34 +974,140 @@ void ResetNavigationExperimentState(OccupancyGrid2D& grid,
     ResetFollowView(viewState);
 }
 
-void UpdateScaleDiagnostics(ScaleDiagnostics& diagnostics,
-                            const Sophus::SE3f& orbTwc,
-                            const PacketHeader& phoneHeader) {
+ScaleUpdateEvent UpdateScaleDiagnostics(ScaleDiagnostics& diagnostics,
+                                        const Sophus::SE3f& orbTwc,
+                                        const PacketHeader& phoneHeader) {
+    ScaleUpdateEvent event;
     const Eigen::Vector3f orbPosition = orbTwc.translation();
-    if(diagnostics.hasOrbPose) {
-        const float delta = (orbPosition - diagnostics.previousOrbPosition).norm();
-        if(std::isfinite(delta) && delta > 0.01f && delta < 1.0f) {
-            diagnostics.orbDistanceMeters += delta;
-            ++diagnostics.orbSegments;
-        }
-    }
-    diagnostics.previousOrbPosition = orbPosition;
-    diagnostics.hasOrbPose = true;
 
-    if(!phoneHeader.hasPose)
-        return;
+    if(!phoneHeader.hasPose) {
+        diagnostics.previousOrbPosition = orbPosition;
+        diagnostics.hasOrbPose = true;
+        event.windowReset = InvalidateScaleDiagnostics(diagnostics, true);
+        if(event.windowReset)
+            event.resetReason = "phone_pose_missing";
+        diagnostics.hasPhonePose = false;
+        return event;
+    }
 
     const Sophus::SE3f phoneTwc = PoseFromHeader(phoneHeader);
     const Eigen::Vector3f phonePosition = phoneTwc.translation();
-    if(diagnostics.hasPhonePose) {
-        const float delta = (phonePosition - diagnostics.previousPhonePosition).norm();
-        if(std::isfinite(delta) && delta > 0.01f && delta < 1.0f) {
-            diagnostics.phoneDistanceMeters += delta;
-            ++diagnostics.phoneSegments;
+    const bool referenceTrusted = IsPhoneReferenceTrusted(phoneHeader);
+
+    auto storeBaseline = [&] {
+        diagnostics.previousOrbPosition = orbPosition;
+        diagnostics.previousPhonePosition = phonePosition;
+        diagnostics.hasOrbPose = true;
+        diagnostics.hasPhonePose = true;
+        if(referenceTrusted && !diagnostics.hasStableAnchor) {
+            diagnostics.hasStableAnchor = true;
+            diagnostics.stableAnchorOrbPosition = orbPosition;
+            diagnostics.stableAnchorPhonePosition = phonePosition;
+            diagnostics.stableOrbDisplacementMeters = 0.0f;
+            diagnostics.stablePhoneDisplacementMeters = 0.0f;
+        }
+        diagnostics.previousPhoneFrameIndex = phoneHeader.frameIndex;
+        diagnostics.previousTimestampSeconds = phoneHeader.timestamp;
+        diagnostics.previousSampleTrusted = referenceTrusted;
+    };
+
+    if(!referenceTrusted) {
+        event.windowReset = InvalidateScaleDiagnostics(diagnostics, true);
+        if(event.windowReset)
+            event.resetReason = "phone_reference_untrusted";
+        storeBaseline();
+        return event;
+    }
+
+    const bool hasTrustedBaseline =
+        diagnostics.hasOrbPose &&
+        diagnostics.hasPhonePose &&
+        diagnostics.previousSampleTrusted;
+    if(!hasTrustedBaseline) {
+        storeBaseline();
+        return event;
+    }
+
+    const bool frameSequenceContinuous =
+        diagnostics.previousPhoneFrameIndex != 0 &&
+        phoneHeader.frameIndex == diagnostics.previousPhoneFrameIndex + 1;
+    const bool timestampContinuous =
+        diagnostics.previousTimestampSeconds > 0.0 &&
+        phoneHeader.timestamp > diagnostics.previousTimestampSeconds &&
+        (phoneHeader.timestamp - diagnostics.previousTimestampSeconds) <= kScaleRatioMaxFrameGapSeconds;
+    if(!frameSequenceContinuous || !timestampContinuous) {
+        InvalidateScaleDiagnostics(diagnostics, false);
+        event.windowReset = ResetRecentScaleWindow(diagnostics);
+        if(event.windowReset)
+            event.resetReason = frameSequenceContinuous ? "timestamp_gap" : "frame_gap";
+        storeBaseline();
+        return event;
+    }
+
+    const float orbDeltaMeters = (orbPosition - diagnostics.previousOrbPosition).norm();
+    const float phoneDeltaMeters = (phonePosition - diagnostics.previousPhonePosition).norm();
+    event.orbDeltaMeters = orbDeltaMeters;
+    event.phoneDeltaMeters = phoneDeltaMeters;
+
+    const bool orbValid = std::isfinite(orbDeltaMeters) && orbDeltaMeters > 0.01f && orbDeltaMeters < 1.0f;
+    const bool phoneValid = std::isfinite(phoneDeltaMeters) && phoneDeltaMeters > 0.01f && phoneDeltaMeters < 1.0f;
+    const float pairRatio = ScaleRatioForDistances(orbDeltaMeters, phoneDeltaMeters);
+    const bool pairRatioImplausible =
+        orbValid &&
+        phoneValid &&
+        std::max(orbDeltaMeters, phoneDeltaMeters) >= kScaleRatioDiscontinuityMinMeters &&
+        (pairRatio > kScaleRatioPairJumpFactor || pairRatio < (1.0f / kScaleRatioPairJumpFactor));
+    const bool pairDiscontinuous =
+        (!orbValid && phoneValid && phoneDeltaMeters >= kScaleRatioDiscontinuityMinMeters) ||
+        (!phoneValid && orbValid && orbDeltaMeters >= kScaleRatioDiscontinuityMinMeters) ||
+        pairRatioImplausible;
+    if(pairDiscontinuous) {
+        InvalidateScaleDiagnostics(diagnostics, false);
+        event.windowReset = ResetRecentScaleWindow(diagnostics);
+        if(event.windowReset)
+            event.resetReason = "paired_motion_discontinuity";
+        storeBaseline();
+        return event;
+    }
+
+    if(orbValid && phoneValid) {
+        diagnostics.orbDistanceMeters += orbDeltaMeters;
+        diagnostics.phoneDistanceMeters += phoneDeltaMeters;
+        diagnostics.stableOrbDisplacementMeters = (orbPosition - diagnostics.stableAnchorOrbPosition).norm();
+        diagnostics.stablePhoneDisplacementMeters = (phonePosition - diagnostics.stableAnchorPhonePosition).norm();
+        ++diagnostics.orbSegments;
+        ++diagnostics.phoneSegments;
+        event.pairAccepted = true;
+
+        if(std::isfinite(phoneHeader.timestamp) && phoneHeader.timestamp > 0.0) {
+            if(!diagnostics.recentSamples.empty() &&
+               phoneHeader.timestamp <= diagnostics.recentSamples.back().timestampSeconds) {
+                ResetRecentScaleWindow(diagnostics);
+            }
+
+            diagnostics.recentSamples.push_back(ScaleWindowSample{
+                phoneHeader.timestamp,
+                orbDeltaMeters,
+                phoneDeltaMeters,
+                diagnostics.previousOrbPosition,
+                diagnostics.previousPhonePosition,
+                orbPosition,
+                phonePosition,
+            });
+            diagnostics.recentOrbDistanceMeters += orbDeltaMeters;
+            diagnostics.recentPhoneDistanceMeters += phoneDeltaMeters;
+
+            while(!diagnostics.recentSamples.empty() &&
+                  (phoneHeader.timestamp - diagnostics.recentSamples.front().timestampSeconds) > kScaleRatioWindowSeconds) {
+                diagnostics.recentOrbDistanceMeters -= diagnostics.recentSamples.front().orbDeltaMeters;
+                diagnostics.recentPhoneDistanceMeters -= diagnostics.recentSamples.front().phoneDeltaMeters;
+                diagnostics.recentSamples.pop_front();
+            }
         }
     }
-    diagnostics.previousPhonePosition = phonePosition;
-    diagnostics.hasPhonePose = true;
+
+    storeBaseline();
+    return event;
 }
 
 float NormalizeAngleDegrees(float angleDegrees) {
@@ -910,7 +1174,7 @@ void UpdateGuidanceFile(const GuidanceState& guidance,
         return;
     lastWriteTime = now;
 
-    ofstream out(path);
+    ostringstream out;
     out << "{\n";
     out << "  \"has_pose\": " << (status.hasPose ? "true" : "false") << ",\n";
     out << "  \"tracking_state\": \"" << status.trackingState << "\",\n";
@@ -920,6 +1184,7 @@ void UpdateGuidanceFile(const GuidanceState& guidance,
     out << "  \"waypoint_distance_m\": " << fixed << setprecision(3) << guidance.waypointDistanceMeters << ",\n";
     out << "  \"heading_error_deg\": " << fixed << setprecision(3) << guidance.headingErrorDegrees << "\n";
     out << "}\n";
+    WriteTextFileAtomically(path, out.str());
 }
 
 bool ReadBackendControl(const string& path, BackendControl& control) {
@@ -989,6 +1254,58 @@ bool ReadBackendControl(const string& path, BackendControl& control) {
         return false;
     }
     return true;
+}
+
+string DescribeBackendControl(const BackendControl& control,
+                              const NavigationSettings& navigationSettings,
+                              bool localizationOnly,
+                              const PlannerState& planner,
+                              bool requestExperimentReset,
+                              bool requestSlamRestart,
+                              bool requestSnapshot,
+                              bool requestQuit) {
+    vector<string> parts;
+    parts.emplace_back("revision=" + to_string(control.revision));
+    if(!control.viewMode.empty())
+        parts.emplace_back("view=" + control.viewMode);
+    parts.emplace_back("depth_mode=" + DepthSourceModeKey(navigationSettings.depthSourceMode));
+    parts.emplace_back(string("tracking_mode=") + (localizationOnly ? "localization" : "slam"));
+    parts.emplace_back(string("height_mode=") + (navigationSettings.fixedHeightMode ? "fixed" : "adaptive"));
+    {
+        ostringstream value;
+        value << fixed << setprecision(2) << "fixed_h=" << navigationSettings.fixedCameraHeightMeters;
+        parts.push_back(value.str());
+    }
+    parts.emplace_back("inflation=" + to_string(navigationSettings.inflationRadiusCells));
+    {
+        ostringstream value;
+        value << fixed << setprecision(2) << "lookahead=" << navigationSettings.lookaheadMeters;
+        parts.push_back(value.str());
+    }
+    if(control.setGoal) {
+        ostringstream value;
+        value << fixed << setprecision(2) << "goal=(" << control.goalWorldX << ", " << control.goalWorldZ << ")";
+        parts.push_back(value.str());
+    }
+    if(control.clearGoal)
+        parts.emplace_back("clear_goal");
+    if(requestSnapshot)
+        parts.emplace_back("save_snapshot");
+    if(requestQuit)
+        parts.emplace_back("quit");
+    if(requestExperimentReset)
+        parts.emplace_back("reset_nav_state");
+    if(requestSlamRestart)
+        parts.emplace_back("restart_slam");
+    parts.emplace_back(string("goal_active=") + (planner.hasGoal ? "yes" : "no"));
+
+    ostringstream stream;
+    for(size_t index = 0; index < parts.size(); ++index) {
+        if(index > 0)
+            stream << "  ";
+        stream << parts[index];
+    }
+    return stream.str();
 }
 
 void ApplyBackendControl(const BackendControl& control,
@@ -1080,9 +1397,8 @@ void WriteBackendState(const string& path,
                        const cv::Rect& mapRect,
                        const cv::Size& compositeSize,
                        bool connected) {
-    ofstream out(path);
-    if(!out.good())
-        return;
+    ostringstream out;
+    const ScaleWindowStats scaleWindow = CurrentScaleWindowStats(diagnostics);
 
     out << "{\n";
     out << "  \"timestamp\": \"" << CurrentTimeString() << "\",\n";
@@ -1108,7 +1424,18 @@ void WriteBackendState(const string& path,
     out << "  \"orbDistanceMeters\": " << fixed << setprecision(3) << diagnostics.orbDistanceMeters << ",\n";
     out << "  \"phoneDistanceMeters\": " << fixed << setprecision(3) << diagnostics.phoneDistanceMeters << ",\n";
     out << "  \"scaleRatio\": " << fixed << setprecision(4)
-        << ((diagnostics.phoneDistanceMeters > 1e-4f) ? (diagnostics.orbDistanceMeters / diagnostics.phoneDistanceMeters) : 0.0f) << ",\n";
+        << ScaleRatioForDistances(diagnostics.orbDistanceMeters, diagnostics.phoneDistanceMeters) << ",\n";
+    out << "  \"stableOrbDisplacementMeters\": " << fixed << setprecision(3) << diagnostics.stableOrbDisplacementMeters << ",\n";
+    out << "  \"stablePhoneDisplacementMeters\": " << fixed << setprecision(3) << diagnostics.stablePhoneDisplacementMeters << ",\n";
+    out << "  \"stableScaleRatio\": " << fixed << setprecision(4)
+        << ScaleRatioForDistances(diagnostics.stableOrbDisplacementMeters, diagnostics.stablePhoneDisplacementMeters) << ",\n";
+    out << "  \"recentOrbDistanceMeters\": " << fixed << setprecision(3) << scaleWindow.orbDistanceMeters << ",\n";
+    out << "  \"recentPhoneDistanceMeters\": " << fixed << setprecision(3) << scaleWindow.phoneDistanceMeters << ",\n";
+    out << "  \"recentScaleRatio\": " << fixed << setprecision(4) << scaleWindow.ratio << ",\n";
+    out << "  \"recentOrbDisplacementMeters\": " << fixed << setprecision(3) << scaleWindow.orbDisplacementMeters << ",\n";
+    out << "  \"recentPhoneDisplacementMeters\": " << fixed << setprecision(3) << scaleWindow.phoneDisplacementMeters << ",\n";
+    out << "  \"recentDisplacementScaleRatio\": " << fixed << setprecision(4) << scaleWindow.displacementRatio << ",\n";
+    out << "  \"recentScaleWindowSeconds\": " << fixed << setprecision(3) << scaleWindow.durationSeconds << ",\n";
     out << "  \"depthModelEnabled\": " << (depthComparison.modelEnabled ? "true" : "false") << ",\n";
     out << "  \"depthComparisonReady\": " << (depthComparison.hasComparison ? "true" : "false") << ",\n";
     out << "  \"depthComparisonStatus\": \"" << depthComparison.status << "\",\n";
@@ -1147,6 +1474,7 @@ void WriteBackendState(const string& path,
     out << "  \"mapDataPath\": \"" << BuildLatestMapDataPath() << "\",\n";
     out << "  \"guidancePath\": \"/tmp/iphone_rgbd_nav_guidance.json\"\n";
     out << "}\n";
+    WriteTextFileAtomically(path, out.str());
 }
 
 chrono::milliseconds EffectiveLatestArtifactsInterval(bool appMode, const NavigationSettings& navigationSettings) {
@@ -1239,13 +1567,13 @@ vector<string> CandidateIps() {
 void PrintCandidateAddresses(int port) {
     const vector<string> ips = CandidateIps();
     if(ips.empty()) {
-        cout << "Listening on port " << port << endl;
+        LogInfo("Listening on port " + to_string(port));
         return;
     }
 
-    cout << "Enter one of these Mac IPs on the phone:" << endl;
+    LogInfo("Enter one of these Mac IPs on the phone:");
     for(const string& ip : ips)
-        cout << "  " << ip << ":" << port << endl;
+        LogInfo("  " + ip + ":" + to_string(port));
 }
 
 PacketHeader ParseHeader(const string& jsonText) {
@@ -1267,6 +1595,9 @@ PacketHeader ParseHeader(const string& jsonText) {
     header.fy = tree.get<float>("fy");
     header.cx = tree.get<float>("cx");
     header.cy = tree.get<float>("cy");
+    header.arTrackingState = tree.get<string>("arTrackingState", "unknown");
+    header.arTrackingReason = tree.get<string>("arTrackingReason", "");
+    header.arWorldMappingStatus = tree.get<string>("arWorldMappingStatus", "unknown");
     if(const auto poseChild = tree.get_child_optional("pose")) {
         size_t index = 0;
         for(const auto& item : *poseChild) {
@@ -2254,6 +2585,102 @@ void MaybeUpdatePlan(const OccupancyGrid2D& grid,
     planner.dirty = false;
 }
 
+void LogPerformanceSummary(const PerformanceWindow& window,
+                           const OccupancyGrid2D& grid,
+                           const PlannerState& planner,
+                           const TrajectoryState& trajectory,
+                           const ScaleDiagnostics& diagnostics,
+                           const DepthComparisonDiagnostics& depthComparison,
+                           const PacketHeader& latestPhoneHeader,
+                           bool localizationOnly) {
+    if(window.frames <= 0)
+        return;
+
+    const double avgCaptureGapMs = AverageMs(window.totalCaptureGapMs, window.captureGapSamples);
+    const double avgProcessingMs = AverageMs(window.totalProcessingMs, window.frames);
+    const double avgTrackMs = AverageMs(window.totalTrackMs, window.trackSamples);
+    const double avgInferenceMs = AverageMs(window.totalInferenceMs, window.inferenceSamples);
+    const double avgMapMs = AverageMs(window.totalMapMs, window.mapSamples);
+    const double avgRenderMs = AverageMs(window.totalRenderMs, window.renderSamples);
+    const double avgFloorSamples = window.poseFrames > 0
+        ? static_cast<double>(window.totalFloorSamples) / static_cast<double>(window.poseFrames)
+        : 0.0;
+    const double avgMapPoints = window.poseFrames > 0
+        ? static_cast<double>(window.totalMapPoints) / static_cast<double>(window.poseFrames)
+        : 0.0;
+    const double inputFps = avgCaptureGapMs > 1e-3 ? (1000.0 / avgCaptureGapMs) : 0.0;
+    const uint64_t gridDelta = window.hasStartGridVersion ? (grid.version() - window.startGridVersion) : 0;
+
+    const MapQualityStats mapStats = ComputeMapQualityStats(grid);
+    const float scalePathRatio = ScaleRatioForDistances(diagnostics.orbDistanceMeters, diagnostics.phoneDistanceMeters);
+    const float stableScaleRatio =
+        ScaleRatioForDistances(diagnostics.stableOrbDisplacementMeters, diagnostics.stablePhoneDisplacementMeters);
+    const ScaleWindowStats scaleWindow = CurrentScaleWindowStats(diagnostics);
+    ostringstream summary;
+    summary << fixed << setprecision(1)
+            << "[PERF] frames=" << window.frames
+            << "  input_fps=" << inputFps
+            << "  process_ms=" << avgProcessingMs
+            << "  track_ms=" << avgTrackMs
+            << "  infer_ms=" << avgInferenceMs
+            << "  map_ms=" << avgMapMs
+            << "  render_ms=" << avgRenderMs
+            << "  avg_floor_samples=" << avgFloorSamples
+            << "  avg_map_points=" << avgMapPoints
+            << "  grid_delta=" << gridDelta
+            << "  path=" << (planner.pathValid ? planner.pathCells.size() : 0)
+            << "  traj=" << trajectory.samples.size();
+    summary << fixed << setprecision(3)
+            << "  scale_path_total=" << scalePathRatio
+            << "  scale_path_recent=" << scaleWindow.ratio
+            << "  scale_stable=" << stableScaleRatio
+            << "  scale_disp_recent=" << scaleWindow.displacementRatio
+            << "  stable_orb_disp_m=" << diagnostics.stableOrbDisplacementMeters
+            << "  stable_phone_disp_m=" << diagnostics.stablePhoneDisplacementMeters
+            << "  recent_orb_path_m=" << scaleWindow.orbDistanceMeters
+            << "  recent_phone_path_m=" << scaleWindow.phoneDistanceMeters
+            << "  recent_orb_disp_m=" << scaleWindow.orbDisplacementMeters
+            << "  recent_phone_disp_m=" << scaleWindow.phoneDisplacementMeters;
+    if(scaleWindow.durationSeconds > 1e-3) {
+        summary << fixed << setprecision(1)
+                << "  scale_window_s=" << scaleWindow.durationSeconds;
+    }
+    if(mapStats.hasBounds) {
+        summary << fixed << setprecision(1);
+        summary << "  map_m=" << mapStats.widthMeters << "x" << mapStats.heightMeters;
+    }
+    summary << "  cells=" << mapStats.knownCells
+            << "  occ=" << mapStats.occupiedCells
+            << "  free=" << mapStats.freeCells
+            << "  mode=" << (localizationOnly ? "LOCALIZATION" : "SLAM")
+            << "  ar_tracking=" << DescribeArkitTrackingState(latestPhoneHeader)
+            << "  ar_mapping=" << latestPhoneHeader.arWorldMappingStatus;
+    if(depthComparison.modelEnabled) {
+        summary << fixed << setprecision(3)
+                << "  depth_overlap=" << depthComparison.overlapRatio
+                << "  depth_mae=" << depthComparison.maeMeters
+                << "  depth_rmse=" << depthComparison.rmseMeters;
+    }
+
+    const bool slowProcessing = avgProcessingMs > kProcessingSummaryWarnMs || avgTrackMs > kTrackSummaryWarnMs;
+    const bool sparseMapping = window.poseFrames > 0 &&
+        (avgFloorSamples < static_cast<double>(kFloorSamplesWarnCount) ||
+         avgMapPoints < static_cast<double>(kMapPointsWarnCount) ||
+         (!localizationOnly && gridDelta == 0));
+    const bool poorDepthQuality = depthComparison.modelEnabled &&
+        (depthComparison.status == "INSUFFICIENT_OVERLAP" ||
+         (depthComparison.hasComparison &&
+          (depthComparison.overlapRatio < kDepthOverlapWarnRatio ||
+           depthComparison.maeMeters > kDepthMaeWarnMeters)));
+    const bool slowInference = depthComparison.modelEnabled &&
+        avgInferenceMs > kInferenceSummaryWarnMs;
+
+    if(slowProcessing || sparseMapping || poorDepthQuality || slowInference)
+        LogWarning(summary.str());
+    else
+        LogInfo(summary.str());
+}
+
 void DrawOccupancyPanel(cv::Mat& panel,
                         OccupancyViewState& view,
                         const OccupancyGrid2D& grid,
@@ -2422,23 +2849,23 @@ void DrawOccupancyPanel(cv::Mat& panel,
 
     {
         ostringstream orbDistanceText;
-        orbDistanceText << fixed << setprecision(2) << "ORB 里程 " << diagnostics.orbDistanceMeters << "m";
+        orbDistanceText << fixed << setprecision(2) << "ORB 路径里程 " << diagnostics.orbDistanceMeters << "m";
         DrawLabel(panel, orbDistanceText.str(), cv::Point(10, 230));
     }
     {
         ostringstream phoneDistanceText;
-        phoneDistanceText << fixed << setprecision(2) << "iPhone 参考里程 " << diagnostics.phoneDistanceMeters << "m";
+        phoneDistanceText << fixed << setprecision(2) << "iPhone 参考路径 " << diagnostics.phoneDistanceMeters << "m";
         DrawLabel(panel, phoneDistanceText.str(), cv::Point(10, 274));
     }
-    if(diagnostics.orbDistanceMeters > 0.15f && diagnostics.phoneDistanceMeters > 0.15f) {
-        const float ratio = diagnostics.orbDistanceMeters / diagnostics.phoneDistanceMeters;
+    if(diagnostics.stableOrbDisplacementMeters > 0.15f && diagnostics.stablePhoneDisplacementMeters > 0.15f) {
+        const float ratio = diagnostics.stableOrbDisplacementMeters / diagnostics.stablePhoneDisplacementMeters;
         ostringstream ratioText;
-        ratioText << fixed << setprecision(3) << "尺度对比 ORB/iPhone = " << ratio << "x";
+        ratioText << fixed << setprecision(3) << "稳定位移尺度 ORB/iPhone = " << ratio << "x";
         DrawLabel(panel, ratioText.str(), cv::Point(10, 318));
     } else {
         DrawLabel(panel, "尺度对比：先多走一段再判断", cv::Point(10, 318));
     }
-    DrawLabel(panel, "说明：仅作尺度参考，不参与建图", cv::Point(10, 362));
+    DrawLabel(panel, "说明：路径里程容易被抖动放大，上面这行更可信", cv::Point(10, 362));
     DrawLabel(panel,
               settings.fixedHeightMode ? ("导航模式：车载固定高度  " + [&]() {
                     ostringstream stream;
@@ -2645,6 +3072,18 @@ string BuildSnapshotPath() {
     return CurrentWorkingDirectory() + "/iphone_rgbd_nav_snapshot_" + to_string(timestamp) + ".png";
 }
 
+string CurrentLogTimestamp() {
+    const auto now = chrono::system_clock::now();
+    const auto nowMs = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    const std::time_t nowTime = chrono::system_clock::to_time_t(now);
+    std::tm localTime {};
+    localtime_r(&nowTime, &localTime);
+    ostringstream stream;
+    stream << put_time(&localTime, "%Y-%m-%d %H:%M:%S")
+           << '.' << setw(3) << setfill('0') << nowMs.count();
+    return stream.str();
+}
+
 string CurrentTimeString() {
     const auto now = chrono::system_clock::now();
     const std::time_t nowTime = chrono::system_clock::to_time_t(now);
@@ -2653,6 +3092,86 @@ string CurrentTimeString() {
     ostringstream stream;
     stream << put_time(&localTime, "%Y-%m-%d %H:%M:%S");
     return stream.str();
+}
+
+const char* LogLevelTag(LogLevel level) {
+    switch(level) {
+        case LogLevel::Info:
+            return "INFO";
+        case LogLevel::Warning:
+            return "WARN";
+        case LogLevel::Error:
+            return "ERROR";
+    }
+    return "INFO";
+}
+
+void WriteLogLine(LogLevel level, const string& message) {
+    const string line = "[" + CurrentLogTimestamp() + "] [" + LogLevelTag(level) + "] " + message;
+
+    lock_guard<mutex> lock(gEventLogMutex);
+    ostream& console = (level == LogLevel::Error) ? cerr : cout;
+    console << line << endl;
+    if(gEventLogFile && gEventLogFile->good()) {
+        (*gEventLogFile) << line << '\n';
+        gEventLogFile->flush();
+    }
+}
+
+void InitializeEventLog(const string& path) {
+    lock_guard<mutex> lock(gEventLogMutex);
+    gEventLogPath = path;
+    gEventLogFile = make_unique<ofstream>(path, ios::app);
+}
+
+void LogInfo(const string& message) {
+    WriteLogLine(LogLevel::Info, message);
+}
+
+void LogWarning(const string& message) {
+    WriteLogLine(LogLevel::Warning, message);
+}
+
+void LogError(const string& message) {
+    WriteLogLine(LogLevel::Error, message);
+}
+
+double AverageMs(double total, int count) {
+    return count > 0 ? (total / static_cast<double>(count)) : 0.0;
+}
+
+bool WriteTextFileAtomically(const string& path, const string& contents) {
+    static atomic<uint64_t> tempFileCounter{0};
+    ostringstream tempPathBuilder;
+    tempPathBuilder << path
+                    << ".tmp."
+                    << getpid()
+                    << '.'
+                    << tempFileCounter.fetch_add(1, std::memory_order_relaxed);
+    const string tempPath = tempPathBuilder.str();
+
+    {
+        ofstream out(tempPath, ios::binary | ios::trunc);
+        if(!out.good()) {
+            LogError("Failed to open temporary file for atomic write: " + tempPath);
+            return false;
+        }
+        out << contents;
+        out.flush();
+        if(!out.good()) {
+            LogError("Failed to flush temporary file for atomic write: " + tempPath);
+            out.close();
+            std::remove(tempPath.c_str());
+            return false;
+        }
+    }
+
+    if(std::rename(tempPath.c_str(), path.c_str()) != 0) {
+        LogError("Failed to replace file atomically: " + path + " (" + std::strerror(errno) + ")");
+        std::remove(tempPath.c_str());
+        return false;
+    }
+    return true;
 }
 
 string BuildLatestSnapshotPath() {
@@ -2720,6 +3239,85 @@ string JsonEscape(const string& input) {
         }
     }
     return output;
+}
+
+float ScaleRatioForDistances(float orbDistanceMeters, float phoneDistanceMeters) {
+    return phoneDistanceMeters > 1e-4f ? (orbDistanceMeters / phoneDistanceMeters) : 0.0f;
+}
+
+bool ScaleRatioLooksWrong(float ratio,
+                          float orbDistanceMeters,
+                          float phoneDistanceMeters,
+                          float minDistanceMeters) {
+    return orbDistanceMeters >= minDistanceMeters &&
+           phoneDistanceMeters >= minDistanceMeters &&
+           std::isfinite(ratio) &&
+           (ratio < kScaleRatioWarnMin || ratio > kScaleRatioWarnMax);
+}
+
+ScaleWindowStats CurrentScaleWindowStats(const ScaleDiagnostics& diagnostics) {
+    ScaleWindowStats stats;
+    stats.orbDistanceMeters = diagnostics.recentOrbDistanceMeters;
+    stats.phoneDistanceMeters = diagnostics.recentPhoneDistanceMeters;
+    stats.ratio = ScaleRatioForDistances(stats.orbDistanceMeters, stats.phoneDistanceMeters);
+    stats.samples = diagnostics.recentSamples.size();
+    if(!diagnostics.recentSamples.empty()) {
+        const ScaleWindowSample& firstSample = diagnostics.recentSamples.front();
+        const ScaleWindowSample& lastSample = diagnostics.recentSamples.back();
+        stats.orbDisplacementMeters = (lastSample.orbEndPosition - firstSample.orbStartPosition).norm();
+        stats.phoneDisplacementMeters = (lastSample.phoneEndPosition - firstSample.phoneStartPosition).norm();
+        stats.displacementRatio = ScaleRatioForDistances(stats.orbDisplacementMeters, stats.phoneDisplacementMeters);
+    }
+    if(diagnostics.recentSamples.size() >= 2) {
+        stats.durationSeconds =
+            diagnostics.recentSamples.back().timestampSeconds - diagnostics.recentSamples.front().timestampSeconds;
+    }
+    return stats;
+}
+
+bool IsPhoneReferenceTrusted(const PacketHeader& header) {
+    return header.hasPose &&
+           header.arTrackingState == "normal" &&
+           header.arWorldMappingStatus != "not_available";
+}
+
+bool ResetRecentScaleWindow(ScaleDiagnostics& diagnostics) {
+    const bool hadSamples = !diagnostics.recentSamples.empty() ||
+                            diagnostics.recentOrbDistanceMeters > 1e-4f ||
+                            diagnostics.recentPhoneDistanceMeters > 1e-4f;
+    diagnostics.recentSamples.clear();
+    diagnostics.recentOrbDistanceMeters = 0.0f;
+    diagnostics.recentPhoneDistanceMeters = 0.0f;
+    return hadSamples;
+}
+
+bool InvalidateScaleDiagnostics(ScaleDiagnostics& diagnostics, bool clearRecentWindow) {
+    const bool hadTrustedBaseline = diagnostics.previousSampleTrusted;
+    diagnostics.previousSampleTrusted = false;
+    diagnostics.previousPhoneFrameIndex = 0;
+    diagnostics.previousTimestampSeconds = 0.0;
+    diagnostics.hasStableAnchor = false;
+    diagnostics.stableAnchorOrbPosition = Eigen::Vector3f::Zero();
+    diagnostics.stableAnchorPhonePosition = Eigen::Vector3f::Zero();
+    diagnostics.stableOrbDisplacementMeters = 0.0f;
+    diagnostics.stablePhoneDisplacementMeters = 0.0f;
+    const bool clearedWindow = clearRecentWindow ? ResetRecentScaleWindow(diagnostics) : false;
+    return hadTrustedBaseline || clearedWindow;
+}
+
+string DescribeArkitTrackingState(const PacketHeader& header) {
+    if(header.arTrackingReason.empty())
+        return header.arTrackingState;
+    return header.arTrackingState + "(" + header.arTrackingReason + ")";
+}
+
+string DescribeArkitReference(const PacketHeader& header) {
+    ostringstream out;
+    out << "tracking=" << DescribeArkitTrackingState(header)
+        << "  mapping=" << header.arWorldMappingStatus
+        << "  phone_pose=" << (header.hasPose ? "yes" : "no")
+        << "  frame=" << header.frameIndex;
+    return out.str();
 }
 
 void WriteCellJsonArray(ostream& out, const string& key, const vector<GridKey>& cells, bool trailingComma) {
@@ -2820,10 +3418,10 @@ MapRenderPayload BuildMapRenderPayload(const string& path,
 void SaveSnapshot(const cv::Mat& image) {
     const string snapshotPath = BuildSnapshotPath();
     cv::imwrite(snapshotPath, image);
-    cout << "Saved navigation snapshot to " << snapshotPath << endl;
+    LogInfo("Saved navigation snapshot to " + snapshotPath);
     const string latestSnapshotPath = BuildLatestSnapshotPath();
     cv::imwrite(latestSnapshotPath, image);
-    cout << "Updated latest navigation snapshot at " << latestSnapshotPath << endl;
+    LogInfo("Updated latest navigation snapshot at " + latestSnapshotPath);
 }
 
 void UpdateLatestArtifacts(AsyncRenderWriter& writer,
@@ -2883,9 +3481,18 @@ int main(int argc, char** argv) {
     const bool appMode = GetEnvFlag("ORB_NAV_APP_MODE");
     const string controlPath = GetEnvOrDefault("ORB_NAV_CONTROL_PATH", "/tmp/iphone_rgbd_nav_control.json");
     const string statePath = GetEnvOrDefault("ORB_NAV_STATE_PATH", "/tmp/iphone_rgbd_nav_state.json");
+    const string eventLogPath = GetEnvOrDefault("ORB_NAV_LOG_PATH", kDefaultEventLogPath);
 #ifdef __APPLE__
     const string depthModelPath = GetEnvOrDefault("ORB_NAV_DEPTH_MODEL_PATH", "models/DepthAnythingV2SmallF16.mlpackage");
 #endif
+    InitializeEventLog(eventLogPath);
+    LogInfo("===== rgbd_iphone_stream session started =====");
+    LogInfo("pid=" + to_string(getpid()) +
+            "  app_mode=" + string(appMode ? "true" : "false") +
+            "  port=" + to_string(port) +
+            "  output_prefix=" + outputPrefix);
+    LogInfo("control_path=" + controlPath + "  state_path=" + statePath + "  log_path=" + eventLogPath);
+
     struct sigaction sigIntHandler {};
     sigIntHandler.sa_handler = ExitLoopHandler;
     sigemptyset(&sigIntHandler.sa_mask);
@@ -2896,7 +3503,7 @@ int main(int argc, char** argv) {
     try {
         serverFd = CreateListenSocket(port);
     } catch(const exception& error) {
-        cerr << "Failed to start server: " << error.what() << endl;
+        LogError("Failed to start server: " + string(error.what()));
         return 1;
     }
 
@@ -2927,7 +3534,7 @@ int main(int argc, char** argv) {
         ? (depthComparison.modelReady ? "READY" : "MODEL_UNAVAILABLE")
         : "DISABLED";
     if(!depthComparison.modelReady)
-        cerr << "Depth comparison model unavailable: " << depthEstimator->Error() << endl;
+        LogWarning("Depth comparison model unavailable: " + depthEstimator->Error());
 #endif
 
     if(!appMode) {
@@ -2942,6 +3549,18 @@ int main(int argc, char** argv) {
     unique_ptr<ORB_SLAM3::System> slam;
     float imageScale = 1.0f;
     bool localizationOnly = false;
+    string loggedTrackingState = liveStatus.trackingState;
+    bool loggedHasPose = liveStatus.hasPose;
+    string loggedDepthSourceStatus = depthSourceState.status;
+    bool loggedPathValid = planner.pathValid;
+    bool loggedScaleRatioWarning = false;
+    bool loggedScaleWindowWarning = false;
+    bool loggedDepthQualityWarning = false;
+    string loggedArkitTrackingState;
+    string loggedArkitTrackingReason;
+    string loggedArkitWorldMappingStatus;
+    PerformanceWindow performanceWindow;
+    double previousFrameTimestamp = 0.0;
 
     while(gKeepRunning) {
         depthSourceState.requestedMode = DepthSourceModeKey(navigationSettings.depthSourceMode);
@@ -3003,17 +3622,31 @@ int main(int argc, char** argv) {
         bool requestExperimentReset = false;
         bool requestSlamRestart = false;
         BackendControl control;
+        const int previousControlRevision = lastControlRevision;
         if(ReadBackendControl(controlPath, control))
             ApplyBackendControl(control, lastControlRevision, viewState, planner, navigationSettings, grid, localizationOnly, slam.get(),
                                 requestExperimentReset, requestSlamRestart, requestSnapshot, requestQuit);
+        if(lastControlRevision != previousControlRevision) {
+            LogInfo("Applied control: " + DescribeBackendControl(control, navigationSettings, localizationOnly, planner,
+                                                                 requestExperimentReset, requestSlamRestart, requestSnapshot, requestQuit));
+        }
         if(requestExperimentReset) {
+            LogInfo("Resetting navigation experiment state while waiting for stream.");
             ResetNavigationExperimentState(grid, planner, trajectory, floorEstimator, navFrameEstimator,
                                            scaleDiagnostics, guidanceState, depthComparison, liveStatus,
                                            viewState, localizationOnly);
             if(requestSlamRestart && slam) {
+                LogInfo("Shutting down ORB-SLAM3 before next stream because control requested a SLAM restart.");
                 slam->Shutdown();
                 slam.reset();
                 imageScale = 1.0f;
+                loggedTrackingState = liveStatus.trackingState;
+                loggedHasPose = liveStatus.hasPose;
+                loggedDepthSourceStatus = depthSourceState.status;
+                loggedPathValid = planner.pathValid;
+                loggedScaleRatioWarning = false;
+                loggedDepthQualityWarning = false;
+                performanceWindow.Reset(grid.version());
             }
         }
         if(requestSnapshot)
@@ -3048,7 +3681,7 @@ int main(int argc, char** argv) {
             if(!WaitForSocketReadable(serverFd, 120))
                 continue;
         } catch(const exception& error) {
-            cerr << "Socket wait failed: " << error.what() << endl;
+            LogError("Socket wait failed: " + string(error.what()));
             break;
         }
 
@@ -3058,30 +3691,87 @@ int main(int argc, char** argv) {
         if(clientFd < 0) {
             if(errno == EINTR && !gKeepRunning)
                 break;
-            cerr << "Failed to accept iPhone connection." << endl;
+            LogWarning("Failed to accept iPhone connection.");
             continue;
         }
 
         char clientIp[INET_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &clientAddress.sin_addr, clientIp, sizeof(clientIp));
-        cout << "Accepted connection from " << clientIp << ":" << ntohs(clientAddress.sin_port) << endl;
+        LogInfo("Accepted connection from " + string(clientIp) + ":" + to_string(ntohs(clientAddress.sin_port)));
         SetSocketTimeout(clientFd, 1800);
 
         StreamFrame firstFrame;
         bool haveFirstRgbdFrame = false;
+        uint64_t warmupTrustedFrames = 0;
+        double warmupTrustedStartTimestamp = 0.0;
+        string lastWarmupReason;
         while(gKeepRunning && !haveFirstRgbdFrame) {
             try {
                 if(!ReceiveFrame(clientFd, firstFrame)) {
-                    cerr << "Stream closed before the first RGB-D frame arrived." << endl;
+                    LogWarning("Stream closed before the first RGB-D frame arrived.");
                     break;
                 }
                 if(firstFrame.depthMm.empty()) {
-                    cerr << "Waiting for first RGB-D depth payload..." << endl;
+                    warmupTrustedFrames = 0;
+                    warmupTrustedStartTimestamp = 0.0;
+                    if(lastWarmupReason != "missing_depth") {
+                        LogWarning("Waiting for first RGB-D depth payload...");
+                        lastWarmupReason = "missing_depth";
+                    }
                     continue;
+                }
+
+                if(!firstFrame.header.hasPose) {
+                    warmupTrustedFrames = 0;
+                    warmupTrustedStartTimestamp = 0.0;
+                    if(lastWarmupReason != "phone_pose_missing") {
+                        LogInfo("Deferring ORB-SLAM3 start until iPhone pose is available.");
+                        lastWarmupReason = "phone_pose_missing";
+                    }
+                    continue;
+                }
+
+                if(!IsPhoneReferenceTrusted(firstFrame.header)) {
+                    warmupTrustedFrames = 0;
+                    warmupTrustedStartTimestamp = 0.0;
+                    const string warmupReason = "tracking=" + DescribeArkitTrackingState(firstFrame.header) +
+                        "  mapping=" + firstFrame.header.arWorldMappingStatus;
+                    if(lastWarmupReason != warmupReason) {
+                        ostringstream warmupLog;
+                        warmupLog << "Deferring ORB-SLAM3 start until ARKit stabilizes"
+                                  << "  " << warmupReason
+                                  << "  frame=" << firstFrame.header.frameIndex;
+                        LogInfo(warmupLog.str());
+                        lastWarmupReason = warmupReason;
+                    }
+                    continue;
+                }
+
+                if(warmupTrustedFrames == 0) {
+                    warmupTrustedStartTimestamp = firstFrame.header.timestamp;
+                    LogInfo("ARKit reference looks healthy. Warming up before starting ORB-SLAM3.");
+                }
+                ++warmupTrustedFrames;
+
+                const double warmupTrustedSeconds =
+                    std::max(0.0, firstFrame.header.timestamp - warmupTrustedStartTimestamp);
+                if(warmupTrustedFrames < static_cast<uint64_t>(kStreamWarmupTrustedFrames) ||
+                   warmupTrustedSeconds < kStreamWarmupTrustedSeconds) {
+                    continue;
+                }
+
+                {
+                    ostringstream warmupComplete;
+                    warmupComplete << fixed << setprecision(2)
+                                   << "Warm-up complete"
+                                   << "  trusted_frames=" << warmupTrustedFrames
+                                   << "  trusted_s=" << warmupTrustedSeconds
+                                   << "  " << DescribeArkitReference(firstFrame.header);
+                    LogInfo(warmupComplete.str());
                 }
                 haveFirstRgbdFrame = true;
             } catch(const exception& error) {
-                cerr << "Failed to receive first frame: " << error.what() << endl;
+                LogError("Failed to receive first frame: " + string(error.what()));
                 break;
             }
         }
@@ -3091,24 +3781,49 @@ int main(int argc, char** argv) {
         }
 
         const string settingsPath = WriteAutoSettings(firstFrame.header, outputPrefix, port);
-        cout << "Auto-generated settings: " << settingsPath << endl;
-        cout << "RGB frame size: " << firstFrame.header.rgbWidth << "x" << firstFrame.header.rgbHeight
-             << ", depth size: " << firstFrame.header.depthWidth << "x" << firstFrame.header.depthHeight
-             << ", depth bytes: " << firstFrame.header.depthSize
-             << ", phone pose: " << (firstFrame.header.hasPose ? "yes" : "no") << endl;
+        {
+            ostringstream frameInfo;
+            frameInfo << "Auto-generated settings: " << settingsPath
+                      << "  rgb=" << firstFrame.header.rgbWidth << "x" << firstFrame.header.rgbHeight
+                      << "  depth=" << firstFrame.header.depthWidth << "x" << firstFrame.header.depthHeight
+                      << "  depth_bytes=" << firstFrame.header.depthSize
+                      << "  " << DescribeArkitReference(firstFrame.header);
+            LogInfo(frameInfo.str());
+        }
 
         if(!slam) {
             slam = make_unique<ORB_SLAM3::System>(vocabularyPath, settingsPath, ORB_SLAM3::System::RGBD, false, 0, outputPrefix);
             imageScale = slam->GetImageScale();
+            LogInfo("Started a new ORB-SLAM3 RGB-D session.");
         } else {
-            cout << "Reconnected RGB-D stream. Continuing current ORB-SLAM3 session." << endl;
+            LogInfo("Reconnected RGB-D stream. Continuing current ORB-SLAM3 session.");
         }
 
         int frameIndex = 0;
         bool sessionDisconnected = false;
         StreamFrame currentFrame = std::move(firstFrame);
+        previousFrameTimestamp = currentFrame.header.timestamp;
+        performanceWindow.Reset(grid.version());
+        loggedScaleRatioWarning = false;
+        loggedScaleWindowWarning = false;
+        loggedDepthQualityWarning = false;
+        loggedArkitTrackingState.clear();
+        loggedArkitTrackingReason.clear();
+        loggedArkitWorldMappingStatus.clear();
 
         while(gKeepRunning) {
+            const auto processingStart = chrono::steady_clock::now();
+            const double captureGapMs =
+                previousFrameTimestamp > 0.0
+                    ? std::max(0.0, (currentFrame.header.timestamp - previousFrameTimestamp) * 1000.0)
+                    : 0.0;
+            previousFrameTimestamp = currentFrame.header.timestamp;
+            double trackMs = 0.0;
+            double mapMs = 0.0;
+            double renderMs = 0.0;
+            size_t floorSampleCount = 0;
+            size_t mapPointCount = 0;
+
             cv::Mat slamRgb = currentFrame.rgb;
             cv::Mat sensorDepthRgb = ResizeDepthToRgb(currentFrame, currentFrame.rgb.size());
             cv::Mat slamDepth = sensorDepthRgb.clone();
@@ -3183,6 +3898,28 @@ int main(int argc, char** argv) {
 #else
             depthComparison = DepthComparisonDiagnostics{};
 #endif
+            const bool depthQualityLooksBad = navigationSettings.enableDepthComparison &&
+                (depthComparison.status == "INFERENCE_FAILED" ||
+                 depthComparison.status == "INSUFFICIENT_OVERLAP" ||
+                 (depthComparison.hasComparison &&
+                  (depthComparison.overlapRatio < kDepthOverlapWarnRatio ||
+                   depthComparison.maeMeters > kDepthMaeWarnMeters)));
+            if(depthQualityLooksBad != loggedDepthQualityWarning) {
+                ostringstream depthLog;
+                depthLog << fixed << setprecision(3)
+                         << "Depth comparison quality "
+                         << (depthQualityLooksBad ? "degraded" : "recovered")
+                         << "  status=" << depthComparison.status
+                         << "  overlap=" << depthComparison.overlapRatio
+                         << "  mae=" << depthComparison.maeMeters
+                         << "  rmse=" << depthComparison.rmseMeters
+                         << "  infer_ms=" << depthComparison.inferenceMs;
+                if(depthQualityLooksBad)
+                    LogWarning(depthLog.str());
+                else
+                    LogInfo(depthLog.str());
+                loggedDepthQualityWarning = depthQualityLooksBad;
+            }
 
             const bool modelDepthUsable = depthComparison.hasComparison && !modelDepthRgb.empty();
             bool skipSlamUpdate = false;
@@ -3221,6 +3958,21 @@ int main(int argc, char** argv) {
                     }
                     break;
             }
+            if(depthSourceState.status != loggedDepthSourceStatus) {
+                LogInfo("Depth source status -> " + depthSourceState.status +
+                        "  active_slam=" + depthSourceState.activeSlamSource +
+                        "  active_map=" + depthSourceState.activeMapSource);
+                loggedDepthSourceStatus = depthSourceState.status;
+            }
+
+            if(currentFrame.header.arTrackingState != loggedArkitTrackingState ||
+               currentFrame.header.arTrackingReason != loggedArkitTrackingReason ||
+               currentFrame.header.arWorldMappingStatus != loggedArkitWorldMappingStatus) {
+                LogInfo("ARKit reference -> " + DescribeArkitReference(currentFrame.header));
+                loggedArkitTrackingState = currentFrame.header.arTrackingState;
+                loggedArkitTrackingReason = currentFrame.header.arTrackingReason;
+                loggedArkitWorldMappingStatus = currentFrame.header.arWorldMappingStatus;
+            }
 
             if(imageScale != 1.0f) {
                 const int scaledWidth = static_cast<int>(std::round(slamRgb.cols * imageScale));
@@ -3241,22 +3993,52 @@ int main(int argc, char** argv) {
 
             bool poseUpdatedThisFrame = false;
             Sophus::SE3f orbTwc;
+            ScaleUpdateEvent scaleUpdateEvent;
             if(!skipSlamUpdate) {
+                const auto trackStart = chrono::steady_clock::now();
                 const Sophus::SE3f Tcw = slam->TrackRGBD(slamRgb, slamDepth, currentFrame.header.timestamp);
+                trackMs = chrono::duration<double, std::milli>(chrono::steady_clock::now() - trackStart).count();
                 const int trackingState = slam->GetTrackingState();
                 liveStatus.trackingState = TrackingStateToString(trackingState);
                 liveStatus.localizationOnly = localizationOnly;
                 liveStatus.hasPose = (trackingState == ORB_SLAM3::Tracking::OK || trackingState == ORB_SLAM3::Tracking::OK_KLT);
                 if(liveStatus.hasPose) {
                     orbTwc = Tcw.inverse();
-                    UpdateScaleDiagnostics(scaleDiagnostics, orbTwc, currentFrame.header);
+                    scaleUpdateEvent = UpdateScaleDiagnostics(scaleDiagnostics, orbTwc, currentFrame.header);
                     navFrameEstimator.Observe(orbTwc, currentFrame.header);
                     liveStatus.currentTwc = navFrameEstimator.TransformPose(orbTwc);
                     poseUpdatedThisFrame = true;
+                } else if(InvalidateScaleDiagnostics(scaleDiagnostics, true)) {
+                    scaleUpdateEvent.windowReset = true;
+                    scaleUpdateEvent.resetReason = "tracking_unstable";
                 }
+            }
+            if(liveStatus.trackingState != loggedTrackingState || liveStatus.hasPose != loggedHasPose) {
+                ostringstream trackingLog;
+                trackingLog << "Tracking state -> " << liveStatus.trackingState
+                            << "  has_pose=" << (liveStatus.hasPose ? "yes" : "no");
+                if(liveStatus.hasPose) {
+                    const Eigen::Vector3f position = liveStatus.currentTwc.translation();
+                    trackingLog << fixed << setprecision(2)
+                                << "  pose=(" << position.x() << ", " << position.y() << ", " << position.z() << ")";
+                }
+                LogInfo(trackingLog.str());
+                loggedTrackingState = liveStatus.trackingState;
+                loggedHasPose = liveStatus.hasPose;
+            }
+            if(scaleUpdateEvent.windowReset && !scaleUpdateEvent.resetReason.empty()) {
+                ostringstream scaleResetLog;
+                scaleResetLog << fixed << setprecision(3)
+                              << "Scale diagnostics reset"
+                              << "  reason=" << scaleUpdateEvent.resetReason
+                              << "  orb_delta=" << scaleUpdateEvent.orbDeltaMeters
+                              << "  phone_delta=" << scaleUpdateEvent.phoneDeltaMeters
+                              << "  " << DescribeArkitReference(currentFrame.header);
+                LogInfo(scaleResetLog.str());
             }
 
             if(poseUpdatedThisFrame && !skipMapIntegration) {
+                const auto mapStart = chrono::steady_clock::now();
                 const cv::Mat& floorDepth = (navigationSettings.depthSourceMode == DepthSourceMode::ModelMap) ? slamDepth : mapDepth;
                 vector<float> floorYSamples;
                 const vector<Eigen::Vector3f> floorPointsOrb = SampleWorldPoints(floorDepth, orbTwc, fx, fy, cx, cy, floorYSamples);
@@ -3265,22 +4047,89 @@ int main(int argc, char** argv) {
                 navYSamples.reserve(floorPointsNav.size());
                 for(const Eigen::Vector3f& point : floorPointsNav)
                     navYSamples.push_back(point.y());
+                floorSampleCount = navYSamples.size();
                 floorEstimator.ObserveFrame(navYSamples, liveStatus.currentTwc.translation().y(), navigationSettings);
                 liveStatus.floorY = floorEstimator.FloorY(liveStatus.currentTwc.translation().y());
 
                 vector<float> mapYSamples;
                 const vector<Eigen::Vector3f> orbWorldPoints = SampleWorldPoints(mapDepth, orbTwc, fx, fy, cx, cy, mapYSamples);
                 const vector<Eigen::Vector3f> navWorldPoints = navFrameEstimator.TransformPoints(orbWorldPoints);
+                mapPointCount = navWorldPoints.size();
                 grid.IntegratePoints(liveStatus.currentTwc.translation(), navWorldPoints, liveStatus.floorY);
+                mapMs = chrono::duration<double, std::milli>(chrono::steady_clock::now() - mapStart).count();
             }
             if(poseUpdatedThisFrame) {
                 AppendTrajectorySample(trajectory, liveStatus);
+                const float stableScaleRatio =
+                    ScaleRatioForDistances(scaleDiagnostics.stableOrbDisplacementMeters,
+                                           scaleDiagnostics.stablePhoneDisplacementMeters);
+                const float scalePathRatio =
+                    ScaleRatioForDistances(scaleDiagnostics.orbDistanceMeters, scaleDiagnostics.phoneDistanceMeters);
+                const bool scaleRatioLooksWrong = ScaleRatioLooksWrong(stableScaleRatio,
+                                                                       scaleDiagnostics.stableOrbDisplacementMeters,
+                                                                       scaleDiagnostics.stablePhoneDisplacementMeters,
+                                                                       kScaleRatioWarnDistanceMeters);
+                if(scaleRatioLooksWrong != loggedScaleRatioWarning) {
+                    ostringstream scaleLog;
+                    scaleLog << fixed << setprecision(3)
+                             << "Scale ratio "
+                             << (scaleRatioLooksWrong ? "out of range" : "back to normal")
+                             << "  stable_ratio=" << stableScaleRatio
+                             << "  stable_orb_m=" << scaleDiagnostics.stableOrbDisplacementMeters
+                             << "  stable_phone_m=" << scaleDiagnostics.stablePhoneDisplacementMeters
+                             << "  path_ratio=" << scalePathRatio
+                             << "  path_orb_m=" << scaleDiagnostics.orbDistanceMeters
+                             << "  path_phone_m=" << scaleDiagnostics.phoneDistanceMeters
+                             << "  " << DescribeArkitReference(currentFrame.header);
+                    if(scaleRatioLooksWrong)
+                        LogWarning(scaleLog.str());
+                    else
+                        LogInfo(scaleLog.str());
+                    loggedScaleRatioWarning = scaleRatioLooksWrong;
+                }
+
+                const ScaleWindowStats scaleWindow = CurrentScaleWindowStats(scaleDiagnostics);
+                const bool scaleWindowLooksWrong = ScaleRatioLooksWrong(scaleWindow.displacementRatio,
+                                                                        scaleWindow.orbDisplacementMeters,
+                                                                        scaleWindow.phoneDisplacementMeters,
+                                                                        kScaleRatioWindowWarnDistanceMeters);
+                if(scaleWindowLooksWrong != loggedScaleWindowWarning) {
+                    ostringstream scaleWindowLog;
+                    scaleWindowLog << fixed << setprecision(3)
+                                   << "Recent scale ratio "
+                                   << (scaleWindowLooksWrong ? "out of range" : "back to normal")
+                                   << "  disp_ratio=" << scaleWindow.displacementRatio
+                                   << "  recent_orb_disp_m=" << scaleWindow.orbDisplacementMeters
+                                   << "  recent_phone_disp_m=" << scaleWindow.phoneDisplacementMeters
+                                   << "  path_ratio=" << scaleWindow.ratio
+                                   << "  recent_orb_path_m=" << scaleWindow.orbDistanceMeters
+                                   << "  recent_phone_path_m=" << scaleWindow.phoneDistanceMeters
+                                   << "  window_s=" << scaleWindow.durationSeconds
+                                   << "  " << DescribeArkitReference(currentFrame.header);
+                    if(scaleWindowLooksWrong)
+                        LogWarning(scaleWindowLog.str());
+                    else
+                        LogInfo(scaleWindowLog.str());
+                    loggedScaleWindowWarning = scaleWindowLooksWrong;
+                }
             }
 
+            const bool previousPathValid = planner.pathValid;
             MaybeUpdatePlan(grid, liveStatus, planner);
+            if(planner.pathValid != previousPathValid || planner.pathValid != loggedPathValid) {
+                if(planner.pathValid) {
+                    ostringstream pathLog;
+                    pathLog << "Planner path ready  cells=" << planner.pathCells.size();
+                    LogInfo(pathLog.str());
+                } else if(planner.hasGoal) {
+                    LogWarning("Planner path unavailable for the current goal.");
+                }
+                loggedPathValid = planner.pathValid;
+            }
             guidanceState = ComputeGuidanceState(grid, liveStatus, planner, navigationSettings);
             UpdateGuidanceFile(guidanceState, liveStatus, navigationSettings);
 
+            const auto renderStart = chrono::steady_clock::now();
             cv::Mat rgbPreview = RotateForPreview(slamRgb, currentFrame.header.displayOrientation);
             cv::Mat rgbPanel = rgbPreview.clone();
             if(appMode) {
@@ -3345,32 +4194,86 @@ int main(int argc, char** argv) {
                                mapDataInterval);
             WriteBackendState(statePath, liveStatus, planner, guidanceState, navigationSettings, depthSourceState, scaleDiagnostics, depthComparison,
                               lastControlRevision, viewState, viewState.panelRect, composite.size(), true);
+            renderMs = chrono::duration<double, std::milli>(chrono::steady_clock::now() - renderStart).count();
 
             bool requestSnapshot = false;
             bool requestQuit = false;
             bool requestExperimentReset = false;
             bool requestSlamRestart = false;
             BackendControl control;
+            const int previousControlRevision = lastControlRevision;
             if(ReadBackendControl(controlPath, control))
                 ApplyBackendControl(control, lastControlRevision, viewState, planner, navigationSettings, grid, localizationOnly, slam.get(),
                                     requestExperimentReset, requestSlamRestart, requestSnapshot, requestQuit);
+            if(lastControlRevision != previousControlRevision) {
+                LogInfo("Applied control: " + DescribeBackendControl(control, navigationSettings, localizationOnly, planner,
+                                                                     requestExperimentReset, requestSlamRestart, requestSnapshot, requestQuit));
+            }
             if(requestExperimentReset) {
+                LogInfo("Resetting navigation experiment state during an active stream.");
                 ResetNavigationExperimentState(grid, planner, trajectory, floorEstimator, navFrameEstimator,
                                                scaleDiagnostics, guidanceState, depthComparison, liveStatus,
                                                viewState, localizationOnly);
                 if(requestSlamRestart && slam) {
+                    LogInfo("Restarting ORB-SLAM3 due to control request.");
                     slam->Shutdown();
                     slam = make_unique<ORB_SLAM3::System>(vocabularyPath, settingsPath, ORB_SLAM3::System::RGBD, false, 0, outputPrefix);
                     imageScale = slam->GetImageScale();
                     if(localizationOnly)
                         slam->ActivateLocalizationMode();
+                    loggedTrackingState = liveStatus.trackingState;
+                    loggedHasPose = liveStatus.hasPose;
+                    loggedDepthSourceStatus = depthSourceState.status;
+                    loggedPathValid = planner.pathValid;
+                    loggedScaleRatioWarning = false;
+                    loggedScaleWindowWarning = false;
+                    loggedDepthQualityWarning = false;
+                    performanceWindow.Reset(grid.version());
                 }
             }
             if(requestSnapshot)
                 SaveSnapshot(composite);
             if(requestQuit) {
+                LogInfo("Quit requested by control.");
                 gKeepRunning = false;
                 break;
+            }
+
+            const double processingMs =
+                chrono::duration<double, std::milli>(chrono::steady_clock::now() - processingStart).count();
+            if(!performanceWindow.hasStartGridVersion)
+                performanceWindow.Reset(grid.version());
+            ++performanceWindow.frames;
+            performanceWindow.totalProcessingMs += processingMs;
+            if(captureGapMs > 1e-3) {
+                ++performanceWindow.captureGapSamples;
+                performanceWindow.totalCaptureGapMs += captureGapMs;
+            }
+            if(trackMs > 1e-3) {
+                ++performanceWindow.trackSamples;
+                performanceWindow.totalTrackMs += trackMs;
+            }
+            if(depthComparison.inferenceMs > 1e-3f) {
+                ++performanceWindow.inferenceSamples;
+                performanceWindow.totalInferenceMs += depthComparison.inferenceMs;
+            }
+            if(mapMs > 1e-3) {
+                ++performanceWindow.mapSamples;
+                performanceWindow.totalMapMs += mapMs;
+            }
+            if(renderMs > 1e-3) {
+                ++performanceWindow.renderSamples;
+                performanceWindow.totalRenderMs += renderMs;
+            }
+            if(poseUpdatedThisFrame) {
+                ++performanceWindow.poseFrames;
+                performanceWindow.totalFloorSamples += floorSampleCount;
+                performanceWindow.totalMapPoints += mapPointCount;
+            }
+            if(performanceWindow.frames >= kPerformanceSummaryFrames) {
+                LogPerformanceSummary(performanceWindow, grid, planner, trajectory, scaleDiagnostics, depthComparison,
+                                      currentFrame.header, localizationOnly);
+                performanceWindow.Reset(grid.version());
             }
 
             if(!appMode) {
@@ -3411,17 +4314,17 @@ int main(int argc, char** argv) {
             while(gKeepRunning) {
                 try {
                     if(!ReceiveFrame(clientFd, nextFrame)) {
-                        cerr << "iPhone stream disconnected." << endl;
+                        LogWarning("iPhone stream disconnected.");
                         sessionDisconnected = true;
                         break;
                     }
                     if(nextFrame.depthMm.empty()) {
-                        cerr << "Skipping frame without RGB-D depth payload." << endl;
+                        LogWarning("Skipping frame without RGB-D depth payload.");
                         continue;
                     }
                     break;
                 } catch(const exception& error) {
-                    cerr << "Stream error: " << error.what() << endl;
+                    LogError("Stream error: " + string(error.what()));
                     sessionDisconnected = true;
                     break;
                 }
@@ -3431,32 +4334,26 @@ int main(int argc, char** argv) {
 
             currentFrame = std::move(nextFrame);
             ++frameIndex;
-            if(frameIndex % 20 == 0) {
-                cout << "[NAV] state=" << liveStatus.trackingState
-                     << "  grid_version=" << grid.version()
-                     << "  path=" << (planner.pathValid ? planner.pathCells.size() : 0)
-                     << "  fixed_h=" << fixed << setprecision(2) << navigationSettings.fixedCameraHeightMeters
-                     << (navigationSettings.fixedHeightMode ? "  mode=FIXED_HEIGHT" : "  mode=ADAPTIVE_HEIGHT")
-                     << "  orb_m=" << fixed << setprecision(2) << scaleDiagnostics.orbDistanceMeters
-                     << "  phone_m=" << fixed << setprecision(2) << scaleDiagnostics.phoneDistanceMeters
-                     << (localizationOnly ? "  mode=LOCALIZATION" : "  mode=SLAM")
-                     << endl;
-            }
         }
 
         close(clientFd);
         if(gKeepRunning && sessionDisconnected) {
-            cout << "Session paused. Waiting for the next iPhone RGB-D stream..." << endl;
+            LogInfo("Session paused. Waiting for the next iPhone RGB-D stream...");
             liveStatus.trackingState = "PAUSED";
+            loggedTrackingState = liveStatus.trackingState;
+            loggedHasPose = liveStatus.hasPose;
         }
     }
 
-    if(slam)
+    if(slam) {
+        LogInfo("Shutting down ORB-SLAM3.");
         slam->Shutdown();
+    }
 
     if(serverFd >= 0)
         close(serverFd);
     if(!appMode)
         cv::destroyAllWindows();
+    LogInfo("===== rgbd_iphone_stream session ended =====");
     return 0;
 }

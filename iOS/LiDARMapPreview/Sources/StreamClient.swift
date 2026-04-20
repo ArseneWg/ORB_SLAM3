@@ -24,6 +24,8 @@ final class StreamClient: @unchecked Sendable {
     private var frameIndex: UInt64 = 0
     private var lastSentTimestamp: TimeInterval = 0
     private let targetFPS: Double = 10.0
+    private let maxJPEGDimension: CGFloat = 640
+    private let jpegCompressionQuality: CGFloat = 0.62
 
     var onStatusChanged: ((String) -> Void)?
     var onFrameCountChanged: ((UInt64) -> Void)?
@@ -137,6 +139,9 @@ private extension StreamClient {
         let fy: Float
         let cx: Float
         let cy: Float
+        let arTrackingState: String
+        let arTrackingReason: String
+        let arWorldMappingStatus: String
         let pose: [Float]
         let rgbSize: Int
         let depthSize: Int
@@ -314,6 +319,7 @@ private extension StreamClient {
         let fy = intrinsics.columns.1.y * scaleY
         let cx = intrinsics.columns.2.x * scaleX
         let cy = intrinsics.columns.2.y * scaleY
+        let tracking = describeTrackingState(frame.camera.trackingState)
 
         let header = PacketHeader(
             version: 1,
@@ -328,6 +334,9 @@ private extension StreamClient {
             fy: fy,
             cx: cx,
             cy: cy,
+            arTrackingState: tracking.state,
+            arTrackingReason: tracking.reason,
+            arWorldMappingStatus: describeWorldMappingStatus(frame.worldMappingStatus),
             pose: poseRows(from: frame.camera.transform),
             rgbSize: rgbData.count,
             depthSize: depthData.count
@@ -354,8 +363,7 @@ private extension StreamClient {
         let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
         let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
 
-        let maxDimension: CGFloat = 512
-        let scale = min(1.0, maxDimension / CGFloat(max(sourceWidth, sourceHeight)))
+        let scale = min(1.0, maxJPEGDimension / CGFloat(max(sourceWidth, sourceHeight)))
         let targetWidth = max(1, Int(CGFloat(sourceWidth) * scale))
         let targetHeight = max(1, Int(CGFloat(sourceHeight) * scale))
 
@@ -366,7 +374,7 @@ private extension StreamClient {
             return nil
         }
 
-        guard let data = UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.45) else {
+        guard let data = UIImage(cgImage: cgImage).jpegData(compressionQuality: jpegCompressionQuality) else {
             return nil
         }
 
@@ -445,6 +453,49 @@ private extension StreamClient {
 
         let value = Int((meters * 1000).rounded())
         return UInt16(clamping: value)
+    }
+
+    func describeTrackingState(_ state: ARCamera.TrackingState) -> (state: String, reason: String) {
+        switch state {
+        case .notAvailable:
+            return ("not_available", "")
+        case .limited(let reason):
+            return ("limited", describeTrackingReason(reason))
+        case .normal:
+            return ("normal", "")
+        @unknown default:
+            return ("unknown", "")
+        }
+    }
+
+    func describeTrackingReason(_ reason: ARCamera.TrackingState.Reason) -> String {
+        switch reason {
+        case .initializing:
+            return "initializing"
+        case .excessiveMotion:
+            return "excessive_motion"
+        case .insufficientFeatures:
+            return "insufficient_features"
+        case .relocalizing:
+            return "relocalizing"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
+    func describeWorldMappingStatus(_ status: ARFrame.WorldMappingStatus) -> String {
+        switch status {
+        case .notAvailable:
+            return "not_available"
+        case .limited:
+            return "limited"
+        case .extending:
+            return "extending"
+        case .mapped:
+            return "mapped"
+        @unknown default:
+            return "unknown"
+        }
     }
 
     func poseRows(from transform: simd_float4x4) -> [Float] {
