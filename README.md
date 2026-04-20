@@ -28,6 +28,16 @@ iPhone (RGB + Depth + Intrinsics + Pose)
 -> macOS ORB Nav Desk
 ```
 
+### Current Interface Snapshot
+
+Latest `ORB Nav Desk` desktop UI captured from a real run of the current fork:
+
+![ORB Nav Desk UI](docs/images/orb_nav_desk_window_latest.jpg)
+
+Latest navigation map exported from that live run:
+
+![ORB Nav Desk Live Map](docs/images/orb_nav_desk_map_latest.png)
+
 ### Key Components In This Fork
 
 - iPhone capture app:
@@ -38,6 +48,8 @@ iPhone (RGB + Depth + Intrinsics + Pose)
   `macOS/ORBNavDesk`
 - Architecture notes for the current fork:
   `iPhone_RGBD_Navigation_Architecture.md`
+- Progress summary and lessons learned:
+  `PROJECT_PROGRESS_AND_LESSONS.md`
 
 ### Current Status
 
@@ -52,6 +64,16 @@ iPhone (RGB + Depth + Intrinsics + Pose)
 2. Run the iPhone app in `iOS/LiDARMapPreview`.
 3. Launch the macOS app in `macOS/ORBNavDesk`.
 4. Start the backend from ORB Nav Desk, then start iPhone streaming.
+
+Notes for the current fork:
+
+- `ORB Nav Desk` now auto-discovers the workspace root when launched from inside the repository.
+  If you launch it from somewhere else, set `ORB_SLAM3_WORKSPACE_ROOT` first.
+- `ORB Nav Desk` can reuse an already-running `rgbd_iphone_stream` listener on port `9000`
+  instead of always spawning a second backend.
+- The backend waits for ARKit tracking and mapping to become trustworthy before starting
+  the main `ORB-SLAM3 TrackRGBD` session.
+- Runtime logs are written to `/tmp/iphone_rgbd_nav_backend.log` and `/tmp/orb_nav_desk.log`.
 
 For the original upstream ORB-SLAM3 dataset examples and ROS workflow, keep reading below.
 

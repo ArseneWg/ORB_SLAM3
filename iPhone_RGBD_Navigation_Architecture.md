@@ -121,6 +121,9 @@ Core behavior:
 - converts ARKit depth to `UInt16` millimeters
 - rescales `fx/fy/cx/cy` to match the transmitted image/depth dimensions
 - serializes the current camera transform into a 4x4 row-major float array
+- includes `ARKit` tracking state, tracking reason, and world-mapping status
+- applies latest-frame backpressure so a slow link does not turn into a stale-frame queue
+- automatically reconnects after disconnects or backend restarts
 
 Purpose:
 
@@ -133,6 +136,12 @@ Effect:
   - RGB bytes
   - depth bytes
 
+Current transport profile:
+
+- target send rate is `10 FPS`
+- RGB is capped at `640` pixels on the long edge
+- JPEG quality is `0.62`
+
 ## 4.3 Transport and receive stage
 
 Source:
@@ -144,8 +153,10 @@ Core behavior:
 - accepts a TCP client from the phone
 - checks packet magic
 - parses header JSON
+- validates header and payload sizes before allocation and decode
 - decodes JPEG into `cv::Mat`
 - restores depth bytes into `CV_16UC1` millimeter depth
+- records session, stream-health, and packet-level diagnostics to a timestamped backend log
 
 Purpose:
 
@@ -191,6 +202,7 @@ Core behavior:
 
 - resizes depth to RGB resolution when needed
 - optionally rescales the frame for runtime processing
+- waits for a short ARKit warm-up window before starting the main ORB session
 - calls `slam->TrackRGBD(slamRgb, slamDepth, timestamp)`
 
 Purpose:
@@ -206,6 +218,7 @@ Effect:
 Important note:
 
 - this is the authoritative pose used for navigation map generation
+- ARKit does not replace ORB-SLAM3 here; it only gates startup and supports diagnostics
 
 ## 4.6 Navigation-frame alignment stage
 
@@ -243,7 +256,9 @@ Core behavior:
 
 - accumulates path length from ORB poses
 - accumulates path length from phone poses
-- computes `scaleRatio`
+- tracks a stable displacement ratio for continuous `OK` tracking segments
+- tracks a recent sliding-window ratio for short-horizon diagnosis
+- resets the recent window when relocalization or motion discontinuities would pollute the measurement
 
 Purpose:
 
@@ -254,11 +269,13 @@ Effect:
 - the UI can display:
   - `ORB 里程`
   - `参考里程`
-  - `尺度比`
+  - `总里程尺度比`
+  - `稳定段尺度比`
+  - `最近窗口尺度比`
 
 Important note:
 
-- `scaleRatio` is informational only
+- `scaleRatio`, `stableScaleRatio`, and recent-window ratios are informational only
 - it is not used to feed corrections back into the main SLAM chain
 
 ## 4.8 3D point sampling stage
@@ -380,6 +397,7 @@ Core behavior:
 - writes backend runtime state JSON
 - writes structured map JSON
 - writes guidance JSON
+- writes those JSON artifacts atomically so the macOS app does not read partial files
 
 Purpose:
 
@@ -399,11 +417,13 @@ Source:
 
 Core behavior:
 
-- starts the backend process
+- auto-discovers the repository workspace root
+- starts the backend process or adopts an already-running backend on port `9000`
 - polls runtime state and map JSON
 - loads latest RGB and depth preview images
 - renders the 2D map natively
-- writes control JSON back to the backend
+- writes control JSON back to the backend atomically
+- monitors backend freshness so the UI can detect a dead adopted backend
 
 Purpose:
 
@@ -435,6 +455,9 @@ Fields:
 | `rgbWidth`, `rgbHeight` | `Int` | Encoded RGB frame size |
 | `depthWidth`, `depthHeight` | `Int` | Depth map size |
 | `fx`, `fy`, `cx`, `cy` | `Float` | Camera intrinsics rescaled to transmitted dimensions |
+| `arTrackingState` | `String` | ARKit camera tracking state |
+| `arTrackingReason` | `String` | ARKit reason when tracking is limited |
+| `arWorldMappingStatus` | `String` | ARKit world-mapping quality |
 | `pose` | `[Float]` | 4x4 camera transform matrix |
 | `rgbSize` | `Int` | JPEG payload length |
 | `depthSize` | `Int` | Depth payload length |
@@ -445,7 +468,11 @@ Purpose:
 
 ## 5.2 Backend runtime state JSON
 
-Defined in:
+Written in:
+
+- `Examples/RGB-D/rgbd_iphone_stream.cc`
+
+Consumed in:
 
 - `macOS/ORBNavDesk/Sources/NavigationState.swift`
 
@@ -463,15 +490,24 @@ Fields:
 | `inflationRadiusCells` | obstacle inflation radius |
 | `showInflation` | whether inflated buffer is enabled |
 | `lookaheadMeters` | guidance lookahead distance |
-| `orbDistanceMeters` | accumulated ORB path length |
-| `phoneDistanceMeters` | accumulated phone reference path length |
-| `scaleRatio` | ORB/reference ratio |
+| `depthSourceMode`, `activeSlamDepthSource`, `activeMapDepthSource` | requested and effective depth-source selection |
+| `depthSourceStatus` | human-readable summary of the current depth-source state |
+| `enableRgbPreview`, `enableDepthPreview`, `enableDepthComparison`, `enableDepthDiffPreview` | preview and depth-diagnostics toggles |
+| `orbDistanceMeters`, `phoneDistanceMeters`, `scaleRatio` | accumulated ORB/reference path lengths and their ratio |
+| `stableOrbDisplacementMeters`, `stablePhoneDisplacementMeters`, `stableScaleRatio` | displacement-based scale diagnostics over stable tracking segments |
+| `recentOrbDistanceMeters`, `recentPhoneDistanceMeters`, `recentScaleRatio` | recent sliding-window path-length diagnostics |
+| `recentOrbDisplacementMeters`, `recentPhoneDisplacementMeters`, `recentDisplacementScaleRatio` | recent sliding-window displacement diagnostics |
+| `recentScaleWindowSeconds` | duration of the recent scale-diagnostics window |
+| `depthModelEnabled`, `depthComparisonReady`, `depthComparisonStatus` | model-depth comparison status |
+| `depthComparisonValidSensorPixels`, `depthComparisonValidOverlapPixels`, `depthComparisonOverlapRatio` | depth-overlap quality summary |
+| `depthComparisonAlignmentScale`, `depthComparisonAlignmentOffset` | depth-alignment fit parameters |
+| `depthComparisonInferenceMs`, `depthComparisonMaeMeters`, `depthComparisonRmseMeters`, `depthComparisonAbsRel`, `depthComparisonBiasMeters` | model-depth inference and error metrics |
 | `hasGoal`, `pathValid`, `hasWaypoint` | planning state |
 | `waypointDistanceMeters` | next waypoint distance |
 | `headingErrorDegrees` | steering error |
 | `viewCenterX`, `viewCenterZ`, `metersPerPixel` | current map view state |
 | `followRobot`, `autoFit` | current view behavior |
-| `latestImagePath`, `latestRgbPath`, `latestDepthPath` | preview image files |
+| `latestImagePath`, `latestRgbPath`, `latestDepthPath`, `latestModelDepthPath`, `latestDepthDiffPath` | preview image files |
 | `mapDataPath` | structured map JSON path |
 | `guidancePath` | guidance JSON path |
 
@@ -562,12 +598,16 @@ Purpose:
 Today, this codebase achieves:
 
 - iPhone RGB-D streaming over TCP
+- auto-reconnect and latest-frame backpressure on the iPhone transport
 - ORB-SLAM3 RGB-D pose tracking on macOS
+- ARKit-aware warm-up before the main ORB session starts
 - 2D occupancy-grid navigation map generation
 - trajectory display
 - grid path planning
 - next-waypoint and heading guidance output
 - a native macOS control desk with map rendering and diagnostics
+- atomic state/map/guidance export with timestamped backend and desktop logs
+- scale diagnostics that separate total path ratio from stable and recent windows
 
 ## 7. Current Boundaries
 
@@ -576,6 +616,7 @@ The current implementation still has clear limits:
 - the 2D navigation map is derived from RGB-D reprojection and floor heuristics
 - ARKit pose is still present as a side-channel alignment and scale reference
 - the system does not yet send direct velocity commands to a robot base
+- intermittent tracking jumps can still happen in low-texture scenes or during aggressive motion
 - long-term persistent relocalization and production-grade costmap layering are not finished
 
 So the current system is best described as:

@@ -1,34 +1,132 @@
 # LiDAR Map Preview
 
-This folder contains the source files for a minimal iPhone app aimed at the
-`iPhone 16 Pro` path we discussed: use `ARKit` world tracking, `LiDAR` scene
-depth, and `RealityKit` mesh visualization to show a room-scale map that is
-actually understandable in a demo.
+This folder contains the iPhone app used as the sensor head for the current
+`iPhone RGB-D -> ORB-SLAM3 -> ORB Nav Desk` workflow.
 
-## What this app does
+The app is no longer just a local mesh demo. Its current primary role is to:
 
-- Uses `ARWorldTrackingConfiguration`
-- Enables `sceneReconstruction = .meshWithClassification` when available
-- Enables `smoothedSceneDepth` or `sceneDepth` when available
-- Shows Apple's built-in scene mesh overlay with `ARView.debugOptions`
-- Displays live status for:
-  - tracking quality
+- run an `ARSession` with world tracking and LiDAR depth
+- stream `RGB + Depth + Intrinsics + ARKit pose` to the Mac backend
+- expose ARKit tracking and mapping quality so the backend can make better
+  startup and diagnostics decisions
+
+## Current behavior
+
+The app currently:
+
+- uses `ARWorldTrackingConfiguration`
+- enables `smoothedSceneDepth` when available, otherwise `sceneDepth`
+- enables `sceneReconstruction = .meshWithClassification` when available
+- shows live status for:
+  - ARKit tracking quality
   - world mapping status
   - mesh anchor count
   - depth availability
   - camera position
-- Includes a restart button for quickly resetting the session before a demo
+  - streaming status
+- includes a restart button to reset the `ARSession`
+- streams to the Mac over TCP with:
+  - JPEG RGB frames
+  - `UInt16` millimeter depth
+  - rescaled intrinsics
+  - 4x4 camera transform
+  - ARKit tracking state and world-mapping status
 
-This follows Apple's official APIs for:
+Transport behavior in the current implementation:
 
-- `ARCamera.transform`
-- `ARFrame.sceneDepth`
-- `ARFrame.smoothedSceneDepth`
-- `ARWorldTrackingConfiguration.sceneReconstruction`
-- `ARWorldTrackingConfiguration.supportsSceneReconstruction(_:)`
-- `ARWorldTrackingConfiguration.supportsFrameSemantics(_:)`
+- target send rate is `10 FPS`
+- RGB is capped at `640` pixels on the long edge
+- JPEG compression quality is `0.62`
+- the client keeps only the latest frame in flight to avoid building a stale queue
+- the client auto-reconnects after disconnects or backend restarts
 
-References:
+## Build and install
+
+Regenerate the project if needed:
+
+```bash
+cd /Users/xy/work/ORB_SLAM3/iOS/LiDARMapPreview
+xcodegen generate
+open LiDARMapPreview.xcodeproj
+```
+
+Or use:
+
+```bash
+/Users/xy/work/ORB_SLAM3/iOS/LiDARMapPreview/open_project.sh
+```
+
+Then:
+
+1. Open the project in `Xcode`.
+2. Choose your signing team for the `LiDARMapPreview` target.
+3. Run on a LiDAR-capable iPhone.
+
+Command-line validation for the project currently uses:
+
+```bash
+xcodebuild -project /Users/xy/work/ORB_SLAM3/iOS/LiDARMapPreview/LiDARMapPreview.xcodeproj -scheme LiDARMapPreview -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO build
+```
+
+The simulator build is only a compile check. Real LiDAR capture and ARKit depth
+behavior still need a physical device.
+
+## End-to-end run with ORB Nav Desk
+
+The current supported path is:
+
+1. Build the repository backend and launch `ORB Nav Desk`.
+2. Let `ORB Nav Desk` start or adopt `rgbd_iphone_stream` on port `9000`.
+3. On the iPhone, enter the Mac IP, keep port `9000`, and tap `Start Stream`.
+4. Wait for the backend warm-up gate to finish. The backend now delays
+   `ORB-SLAM3 TrackRGBD` startup until ARKit tracking and mapping look stable.
+5. Use `ORB Nav Desk` to inspect RGB, depth, map growth, guidance, and logs.
+
+The matching Mac-side pieces are:
+
+- [StreamClient.swift](/Users/xy/work/ORB_SLAM3/iOS/LiDARMapPreview/Sources/StreamClient.swift)
+- [rgbd_iphone_stream.cc](/Users/xy/work/ORB_SLAM3/Examples/RGB-D/rgbd_iphone_stream.cc)
+- [AppModel.swift](/Users/xy/work/ORB_SLAM3/macOS/ORBNavDesk/Sources/AppModel.swift)
+
+## Diagnostics and logs
+
+For live debugging and run review, the current system records:
+
+- backend log: `/tmp/iphone_rgbd_nav_backend.log`
+- desktop app log: `/tmp/orb_nav_desk.log`
+- runtime state: `/tmp/iphone_rgbd_nav_state.json`
+
+The stream header now includes:
+
+- `arTrackingState`
+- `arTrackingReason`
+- `arWorldMappingStatus`
+
+Those fields are used for:
+
+- startup warm-up gating
+- scale diagnostics
+- post-run log analysis
+
+## Capture guidance
+
+For the cleanest mapping run:
+
+- use the rear camera
+- start with textured, static surfaces in view
+- move smoothly instead of whipping the phone around
+- avoid long stretches of blank walls, mirrors, or moving people
+- wait until ARKit reports a healthy mapping state before expecting stable SLAM
+- if tracking drops to `limited` or `not_available`, pause and let the session recover
+
+## Legacy note
+
+The older Python receiver path in `tools/lidar_stream_receiver.py` is now a
+legacy reference flow. The primary maintained path in this fork is:
+
+`LiDARMapPreview -> rgbd_iphone_stream -> ORB Nav Desk`
+
+## Apple API references
 
 - [ARCamera.transform](https://developer.apple.com/documentation/arkit/arcamera/transform)
 - [ARFrame.sceneDepth](https://developer.apple.com/documentation/arkit/arframe/scenedepth)
@@ -36,78 +134,3 @@ References:
 - [ARWorldTrackingConfiguration.sceneReconstruction](https://developer.apple.com/documentation/arkit/arworldtrackingconfiguration/scenereconstruction)
 - [Visualizing and interacting with a reconstructed scene](https://developer.apple.com/documentation/ARKit/visualizing-and-interacting-with-a-reconstructed-scene)
 - [Displaying a point cloud using scene depth](https://developer.apple.com/documentation/ARKit/displaying-a-point-cloud-using-scene-depth)
-
-## Current limitation on this Mac
-
-This Mac currently has the Command Line Tools active, but not the full `Xcode`
-app installed. That means I can prepare the iPhone project here, but I can't
-compile or install the app onto your phone from this machine yet.
-
-I confirmed that:
-
-- `xcodebuild` is unavailable because the full `Xcode.app` is missing
-- your `iPhone 16 Pro` is visible to the Mac as a Continuity Camera device
-
-## Fastest way to use these files
-
-1. Install full `Xcode` from the App Store on this Mac.
-2. Open [project.yml](/Users/xy/work/ORB_SLAM3/iOS/LiDARMapPreview/project.yml) with `XcodeGen`:
-   ```bash
-   cd /Users/xy/work/ORB_SLAM3/iOS/LiDARMapPreview
-   xcodegen generate
-   open LiDARMapPreview.xcodeproj
-   ```
-   Or just run:
-   ```bash
-   /Users/xy/work/ORB_SLAM3/iOS/LiDARMapPreview/open_project.sh
-   ```
-3. In Xcode, choose your signing team for the `LiDARMapPreview` target.
-4. Run on your `iPhone 16 Pro`.
-
-`XcodeGen` is already installed on this Mac, so once `Xcode` is available the
-project file can be regenerated directly from [project.yml](/Users/xy/work/ORB_SLAM3/iOS/LiDARMapPreview/project.yml).
-
-## Demo guidance
-
-For the cleanest room-map demo:
-
-- Use the rear camera, not the front camera.
-- Start 1 to 2 meters away from a wall, desk, or sofa.
-- Move slowly in an arc instead of pacing back and forth.
-- Keep textured, static surfaces in view.
-- Avoid pointing mostly at people or mirrors.
-- Wait until the app shows `Mapping: mapped` before presenting it.
-
-## Next step after Xcode is available
-
-Once full `Xcode` is installed, I can continue with either:
-
-1. polishing this on-device mesh preview for demos, or
-2. building a second stage that streams `RGB + depth + pose` back to the Mac.
-
-## Mac streaming stage
-
-The second stage now has a matching Mac-side receiver:
-
-- [StreamClient.swift](/Users/xy/work/ORB_SLAM3/iOS/LiDARMapPreview/Sources/StreamClient.swift)
-- [lidar_stream_receiver.py](/Users/xy/work/ORB_SLAM3/tools/lidar_stream_receiver.py)
-- [run_lidar_stream_receiver.sh](/Users/xy/work/ORB_SLAM3/tools/run_lidar_stream_receiver.sh)
-
-Quick start:
-
-1. On the Mac, run:
-   ```bash
-   /Users/xy/work/ORB_SLAM3/tools/run_lidar_stream_receiver.sh
-   ```
-2. The script prints one or more local IP addresses such as `192.168.x.x:9000`.
-3. On the iPhone, enter that IP in the `Mac IP` field, keep the default port `9000`, and tap `Start Stream`.
-4. The Mac viewer will show:
-   - live RGB
-   - live depth
-   - a growing top-down map using streamed pose + depth
-
-Keys in the Mac viewer:
-
-- `q` or `Esc`: quit
-- `c`: clear the accumulated map
-- `p`: save a `PLY` map and a PNG screenshot
